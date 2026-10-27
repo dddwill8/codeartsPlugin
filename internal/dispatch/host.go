@@ -58,7 +58,12 @@ func currentHTTP() *http.Client {
 }
 
 func callHost(method string, payload any) (json.RawMessage, error) {
-	c := currentCaller()
+	return callCaller(currentCaller(), method, payload)
+}
+
+// callCaller invokes c, not whatever currentCaller is now.
+// The caller lock is not held across Call; Call can block while SetCaller runs.
+func callCaller(c Caller, method string, payload any) (json.RawMessage, error) {
 	if c == nil {
 		return nil, fmt.Errorf("host callback is unavailable")
 	}
@@ -157,10 +162,14 @@ func hostAuthSave(name string, rawJSON []byte) error {
 }
 
 func hostStreamEmit(streamID string, payload []byte) error {
-	if strings.TrimSpace(streamID) == "" || currentCaller() == nil {
+	return hostStreamEmitOn(currentCaller(), streamID, payload)
+}
+
+func hostStreamEmitOn(c Caller, streamID string, payload []byte) error {
+	if strings.TrimSpace(streamID) == "" || c == nil {
 		return nil
 	}
-	_, err := callHost(pluginabi.MethodHostStreamEmit, map[string]any{
+	_, err := callCaller(c, pluginabi.MethodHostStreamEmit, map[string]any{
 		"stream_id": streamID,
 		"payload":   payload,
 	})
@@ -168,14 +177,18 @@ func hostStreamEmit(streamID string, payload []byte) error {
 }
 
 func hostStreamClose(streamID, errMsg string) {
-	if strings.TrimSpace(streamID) == "" || currentCaller() == nil {
+	hostStreamCloseOn(currentCaller(), streamID, errMsg)
+}
+
+func hostStreamCloseOn(c Caller, streamID, errMsg string) {
+	if strings.TrimSpace(streamID) == "" || c == nil {
 		return
 	}
 	payload := map[string]any{"stream_id": streamID}
 	if errMsg != "" {
 		payload["error"] = errMsg
 	}
-	_, _ = callHost(pluginabi.MethodHostStreamClose, payload)
+	_, _ = callCaller(c, pluginabi.MethodHostStreamClose, payload)
 }
 
 func hostHTTPDoStream(callbackID string, req *http.Request) (status int, headers http.Header, streamID string, body []byte, err error) {
@@ -220,7 +233,11 @@ func hostHTTPDoStream(callbackID string, req *http.Request) (status int, headers
 }
 
 func hostHTTPStreamRead(streamID string) (payload []byte, done bool, err error) {
-	result, err := callHost(pluginabi.MethodHostHTTPStreamRead, map[string]any{"stream_id": streamID})
+	return hostHTTPStreamReadOn(currentCaller(), streamID)
+}
+
+func hostHTTPStreamReadOn(c Caller, streamID string) (payload []byte, done bool, err error) {
+	result, err := callCaller(c, pluginabi.MethodHostHTTPStreamRead, map[string]any{"stream_id": streamID})
 	if err != nil {
 		return nil, true, err
 	}
@@ -239,10 +256,14 @@ func hostHTTPStreamRead(streamID string) (payload []byte, done bool, err error) 
 }
 
 func hostHTTPStreamClose(streamID string) {
-	if streamID == "" || currentCaller() == nil {
+	hostHTTPStreamCloseOn(currentCaller(), streamID)
+}
+
+func hostHTTPStreamCloseOn(c Caller, streamID string) {
+	if streamID == "" || c == nil {
 		return
 	}
-	_, _ = callHost(pluginabi.MethodHostHTTPStreamClose, map[string]any{"stream_id": streamID})
+	_, _ = callCaller(c, pluginabi.MethodHostHTTPStreamClose, map[string]any{"stream_id": streamID})
 }
 
 func hostLog(level, msg string) {

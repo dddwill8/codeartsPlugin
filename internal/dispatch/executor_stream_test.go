@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/dddwill8/codeartsPlugin/internal/protocol"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
@@ -183,4 +184,122 @@ func TestExecuteStreamDoesNotRetryWhenStreamReadIsNotRouteMiss(t *testing.T) {
 	if len(maas) != 1 || maas[0] == "benefit" {
 		t.Fatalf("maas = %v", maas)
 	}
+}
+
+// openedStreamHost returns HTTP 200 and a stream id with no chunks.
+// The first stream_read signals entered and blocks until release is closed.
+// Later reads return immediately with done:false.
+type openedStreamHost struct {
+	mu      sync.Mutex
+	reads   int
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (h *openedStreamHost) Call(method string, payload []byte) ([]byte, error) {
+	switch method {
+	case pluginabi.MethodHostHTTPDoStream:
+		return okEnvelope(map[string]any{
+			"status_code": http.StatusOK,
+			"stream_id":   "hs-open",
+		})
+	case pluginabi.MethodHostHTTPStreamRead:
+		h.mu.Lock()
+		h.reads++
+		first := h.reads == 1
+		h.mu.Unlock()
+		if first {
+			close(h.entered)
+			<-h.release
+		}
+		return okEnvelope(map[string]any{"done": false})
+	default:
+		return okEnvelope(map[string]any{})
+	}
+}
+
+func (h *openedStreamHost) streamReads() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.reads
+}
+
+// replacementCaller records every Call. A hit means the forwarder followed SetCaller.
+type replacementCaller struct {
+	mu      sync.Mutex
+	methods []string
+}
+
+func (c *replacementCaller) Call(method string, payload []byte) ([]byte, error) {
+	c.mu.Lock()
+	c.methods = append(c.methods, method)
+	c.mu.Unlock()
+	return okEnvelope(map[string]any{})
+}
+
+func (c *replacementCaller) calls() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]string, len(c.methods))
+	copy(out, c.methods)
+	return out
+}
+
+func TestForwardHostStreamStopsWhenCallerIsReplaced(t *testing.T) {
+	resetForTest(t)
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	closeRelease := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(closeRelease)
+
+	host := &openedStreamHost{entered: entered, release: release}
+	SetCaller(host)
+
+	env := mustHandle(t, pluginabi.MethodExecutorExecuteStream, executeStreamRequest(t))
+	if !env.OK {
+		msg := ""
+		if env.Error != nil {
+			msg = env.Error.Code + ": " + env.Error.Message
+		}
+		t.Fatalf("execute_stream not ok: %s", msg)
+	}
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for first stream_read")
+	}
+
+	repl := &replacementCaller{}
+	SetCaller(repl)
+	closeRelease()
+
+	deadline := time.Now().Add(time.Second)
+	last := -1
+	stable := 0
+	for time.Now().Before(deadline) {
+		if calls := repl.calls(); len(calls) != 0 {
+			t.Fatalf("replacement caller invoked: %v", calls)
+		}
+		reads := host.streamReads()
+		if reads > 2 {
+			t.Fatalf("stream_read count climbed to %d", reads)
+		}
+		if reads == last && (reads == 1 || reads == 2) {
+			stable++
+			if stable >= 5 {
+				if calls := repl.calls(); len(calls) != 0 {
+					t.Fatalf("replacement caller invoked: %v", calls)
+				}
+				return
+			}
+		} else {
+			stable = 0
+			last = reads
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("forwarder did not stop: stream_read=%d replacement=%v", host.streamReads(), repl.calls())
 }

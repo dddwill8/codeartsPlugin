@@ -141,8 +141,10 @@ func executeStream(callbackID, pluginStreamID string, httpReq *http.Request, ret
 		headers.Set("Content-Type", "text/event-stream")
 	}
 
-	if hostStreamID != "" && pluginStreamID != "" && currentCaller() != nil {
-		go forwardHostStream(hostStreamID, pluginStreamID)
+	// Capture the caller that opened the stream before the goroutine is scheduled.
+	// A later SetCaller must not retarget reads, emits, or closes.
+	if owner := currentCaller(); hostStreamID != "" && pluginStreamID != "" && owner != nil {
+		go forwardHostStream(owner, hostStreamID, pluginStreamID)
 		return okEnvelope(map[string]any{"headers": headers})
 	}
 
@@ -159,19 +161,38 @@ func executeStream(callbackID, pluginStreamID string, httpReq *http.Request, ret
 	})
 }
 
-func forwardHostStream(hostStreamID, pluginStreamID string) {
-	defer hostHTTPStreamClose(hostStreamID)
-	defer hostStreamClose(pluginStreamID, "")
+func forwardHostStream(owner Caller, hostStreamID, pluginStreamID string) {
+	if owner == nil {
+		return
+	}
+	defer func() {
+		if currentCaller() != owner {
+			return
+		}
+		hostHTTPStreamCloseOn(owner, hostStreamID)
+	}()
+	defer func() {
+		if currentCaller() != owner {
+			return
+		}
+		hostStreamCloseOn(owner, pluginStreamID, "")
+	}()
 	for {
-		payload, done, err := hostHTTPStreamRead(hostStreamID)
+		if currentCaller() != owner {
+			return
+		}
+		payload, done, err := hostHTTPStreamReadOn(owner, hostStreamID)
+		if currentCaller() != owner {
+			return
+		}
 		if len(payload) > 0 {
-			if errEmit := hostStreamEmit(pluginStreamID, payload); errEmit != nil {
-				hostStreamClose(pluginStreamID, errEmit.Error())
+			if errEmit := hostStreamEmitOn(owner, pluginStreamID, payload); errEmit != nil {
+				hostStreamCloseOn(owner, pluginStreamID, errEmit.Error())
 				return
 			}
 		}
 		if err != nil {
-			hostStreamClose(pluginStreamID, err.Error())
+			hostStreamCloseOn(owner, pluginStreamID, err.Error())
 			return
 		}
 		if done {
@@ -220,5 +241,3 @@ func handleExecutorHTTP(request []byte) ([]byte, error) {
 		Body:       rawResp,
 	})
 }
-
-
