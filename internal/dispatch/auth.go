@@ -134,12 +134,14 @@ func handleLoginPoll(request []byte) ([]byte, error) {
 	}
 	lc := loginConfig()
 	callbackID := jsonString(request, "host_callback_id", "HostCallbackID")
-	capturedCode, capturedSecret := copyCaptured(sess)
+	capturedCode, capturedSecret := claimCaptured(sess)
 
 	if capturedCode != "" {
 		tok, err := exchangeCode(callbackID, lc, sess, capturedCode)
 		if err != nil {
-			clearCapturedCode(sess)
+			// The code was claimed before exchange. Do not clear CapturedCode
+			// again: captureCallback may have stored a newer code during the
+			// HTTP call, and that code must remain.
 			return okEnvelope(pluginapi.AuthLoginPollResponse{
 				Status:  pluginapi.AuthLoginStatusPending,
 				Message: "authorization code rejected: " + err.Error() + "; paste a new callback URL or reset login",
@@ -344,11 +346,15 @@ func getSession(id string) *loginSession {
 	return sessions[id]
 }
 
-// copyCaptured snapshots the callback strings. Poll must use the copies;
-// sessMu is not held across hostHTTPDo, and the code is left in place.
-func copyCaptured(sess *loginSession) (code, secret string) {
+// claimCaptured copies CapturedCode and CapturedSecret. A non-empty code is
+// cleared before sessMu is released so this poll owns it. CapturedSecret is
+// left in place. Do not hold sessMu across hostHTTPDo.
+func claimCaptured(sess *loginSession) (code, secret string) {
 	sessMu.Lock()
 	code, secret = sess.CapturedCode, sess.CapturedSecret
+	if code != "" {
+		sess.CapturedCode = ""
+	}
 	sessMu.Unlock()
 	return code, secret
 }
@@ -429,15 +435,6 @@ func latestSession() *loginSession {
 		}
 	}
 	return latest
-}
-
-func clearCapturedCode(sess *loginSession) {
-	if sess == nil {
-		return
-	}
-	sessMu.Lock()
-	sess.CapturedCode = ""
-	sessMu.Unlock()
 }
 
 func truncate(s string, n int) string {
