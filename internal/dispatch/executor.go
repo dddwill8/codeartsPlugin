@@ -112,6 +112,14 @@ func executeStream(callbackID, pluginStreamID string, httpReq *http.Request, ret
 	if err != nil {
 		return errorEnvelope("executor_error", err.Error(), http.StatusBadGateway), nil
 	}
+	// do_stream may return only status, headers, and a stream id. The route-miss
+	// body is then the first host.http.stream_read payload, not chunks.
+	if status == http.StatusNotFound && len(buffered) == 0 && hostStreamID != "" {
+		payload, _, _ := hostHTTPStreamRead(hostStreamID)
+		if len(payload) > 0 {
+			buffered = payload
+		}
+	}
 	if status == http.StatusNotFound && routeMissed(buffered) && retryBenefit != nil {
 		if retryReq, retryErr := retryBenefit(); retryErr == nil && retryReq != nil {
 			if hostStreamID != "" {
