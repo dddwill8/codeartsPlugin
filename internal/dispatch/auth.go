@@ -13,15 +13,15 @@ import (
 )
 
 type loginSession struct {
-	ID             string
-	TicketID       string
-	Secret         string
-	Verifier       string
-	DPoP           protocol.DPoPPrivateJWK
-	Port           int
-	AuthURL        string
-	CreatedAt      time.Time
-	ExpiresAt      time.Time
+	ID               string
+	TicketID         string
+	Secret           string
+	Verifier         string
+	DPoP             protocol.DPoPPrivateJWK
+	Port             int
+	AuthURL          string
+	CreatedAt        time.Time
+	ExpiresAt        time.Time
 	CapturedCode     string
 	CapturedSecret   string
 	CapturedRedirect string
@@ -134,9 +134,10 @@ func handleLoginPoll(request []byte) ([]byte, error) {
 	}
 	lc := loginConfig()
 	callbackID := jsonString(request, "host_callback_id", "HostCallbackID")
+	capturedCode, capturedSecret := copyCaptured(sess)
 
-	if sess.CapturedCode != "" {
-		tok, err := exchangeCode(callbackID, lc, sess, sess.CapturedCode)
+	if capturedCode != "" {
+		tok, err := exchangeCode(callbackID, lc, sess, capturedCode)
 		if err != nil {
 			clearCapturedCode(sess)
 			return okEnvelope(pluginapi.AuthLoginPollResponse{
@@ -150,9 +151,9 @@ func handleLoginPoll(request []byte) ([]byte, error) {
 	// Ticket GET is not DPoP-bound. Completing on ticket STS would persist
 	// sess.DPoP beside credentials whose refresh_token (if any) was issued
 	// without that key, and it races the authorization_code exchange.
-	tok, err := pollTicket(callbackID, lc, sess)
+	tok, err := pollTicket(callbackID, lc, sess, capturedSecret)
 	msg := "waiting for Huawei authorization code"
-	if sess.CapturedSecret != "" {
+	if capturedSecret != "" {
 		msg = "received portal secret; continue Huawei login, then paste the callback URL that contains code="
 	}
 	if err != nil {
@@ -281,10 +282,10 @@ func exchangeCode(callbackID string, lc protocol.LoginConfig, sess *loginSession
 	return tok, nil
 }
 
-func pollTicket(callbackID string, lc protocol.LoginConfig, sess *loginSession) (protocol.TokenResponse, error) {
+func pollTicket(callbackID string, lc protocol.LoginConfig, sess *loginSession, capturedSecret string) (protocol.TokenResponse, error) {
 	secret := sess.Secret
-	if sess.CapturedSecret != "" {
-		secret = sess.CapturedSecret
+	if capturedSecret != "" {
+		secret = capturedSecret
 	}
 	req, err := protocol.NewTicketRequest(lc, sess.TicketID, secret)
 	if err != nil {
@@ -322,8 +323,8 @@ func authDataFromCredential(c protocol.Credential, fileName string) pluginapi.Au
 		Label:       label,
 		StorageJSON: raw,
 		Metadata: map[string]any{
-			"type":     protocol.Provider,
-			"user_id":  c.UserID,
+			"type":      protocol.Provider,
+			"user_id":   c.UserID,
 			"user_name": c.UserName,
 		},
 	}
@@ -341,6 +342,15 @@ func getSession(id string) *loginSession {
 	defer sessMu.Unlock()
 	gcSessionsLocked()
 	return sessions[id]
+}
+
+// copyCaptured snapshots the callback strings. Poll must use the copies;
+// sessMu is not held across hostHTTPDo, and the code is left in place.
+func copyCaptured(sess *loginSession) (code, secret string) {
+	sessMu.Lock()
+	code, secret = sess.CapturedCode, sess.CapturedSecret
+	sessMu.Unlock()
+	return code, secret
 }
 
 func delSession(id string) {
