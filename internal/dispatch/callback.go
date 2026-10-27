@@ -67,12 +67,12 @@ func stopCallbackListenerLocked() {
 }
 
 func handleOAuthCallbackHTTP(w http.ResponseWriter, r *http.Request) {
-	code := r.URL.Query().Get("code")
-	secret := r.URL.Query().Get("secret")
-	redirect := r.URL.Query().Get("redirect")
-	if secret != "" {
-		captureCallback("", secret)
-	}
+	q := r.URL.Query()
+	code := q.Get("code")
+	secret := q.Get("secret")
+	redirect := q.Get("redirect")
+	state := q.Get("state")
+	ticketID := q.Get("ticket_id")
 	if code == "" {
 		body, _ := io.ReadAll(io.LimitReader(r.Body, 64<<10))
 		vals, _ := url.ParseQuery(string(body))
@@ -85,7 +85,14 @@ func handleOAuthCallbackHTTP(w http.ResponseWriter, r *http.Request) {
 		if redirect == "" {
 			redirect = vals.Get("redirect")
 		}
+		if state == "" {
+			state = vals.Get("state")
+		}
+		if ticketID == "" {
+			ticketID = vals.Get("ticket_id")
+		}
 	}
+	captureCallback(code, secret, state, ticketID)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if code == "" {
 		safe := protocol.SafePortalRedirect(redirect)
@@ -104,28 +111,18 @@ func handleOAuthCallbackHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("<!doctype html><html><body><h3>还没有授权码，这不是最终失败。</h3><p>把浏览器地址栏完整 URL 粘贴到 CPA 管理界面的 OAuth 登录。第一跳只有 secret，第二跳才有 code=。</p></body></html>"))
 		return
 	}
-	captureCallback(code, secret)
 	_, _ = w.Write([]byte("<!doctype html><html><body><h3>已接收授权码，可关闭此页面。</h3><p>回到 CLIProxyAPI 等待 auth.login.poll 完成。</p></body></html>"))
 }
 
 func applyPastedCallback(raw string) protocol.CallbackParts {
 	parts := protocol.ParseCallback(raw)
-	captureCallback(parts.Code, parts.Secret)
-	if safe := protocol.SafePortalRedirect(parts.Redirect); safe != "" {
-		sessMu.Lock()
-		var latest *loginSession
-		for _, s := range sessions {
-			if latest == nil || s.CreatedAt.After(latest.CreatedAt) {
-				latest = s
-			}
+	bound := captureCallback(parts.Code, parts.Secret, parts.State, parts.TicketID)
+	if bound != nil {
+		if safe := protocol.SafePortalRedirect(parts.Redirect); safe != "" {
+			sessMu.Lock()
+			bound.CapturedRedirect = safe
+			sessMu.Unlock()
 		}
-		if latest != nil {
-			latest.CapturedRedirect = safe
-			if parts.Secret != "" {
-				latest.CapturedSecret = parts.Secret
-			}
-		}
-		sessMu.Unlock()
 	}
 	return parts
 }

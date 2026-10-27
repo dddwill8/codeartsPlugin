@@ -662,6 +662,135 @@ func TestOAuthCallbackHTTPFirstHopDoesNotRedirectOrFail(t *testing.T) {
 	}
 }
 
+func TestCallbackDiscardUnlessStateTicketOrSoleSession(t *testing.T) {
+	resetForTest(t)
+	regReq, _ := json.Marshal(lifecycleRequest{ConfigYAML: []byte("oauth_callback_port: 0\n")})
+	_ = mustResult(t, pluginabi.MethodPluginRegister, regReq)
+
+	start := func() pluginapi.AuthLoginStartResponse {
+		t.Helper()
+		raw := mustResult(t, pluginabi.MethodAuthLoginStart, nil)
+		var resp pluginapi.AuthLoginStartResponse
+		if err := json.Unmarshal(raw, &resp); err != nil {
+			t.Fatal(err)
+		}
+		if resp.State == "" {
+			t.Fatal("missing login state")
+		}
+		return resp
+	}
+	snap := func(id string) (code, secret string) {
+		t.Helper()
+		sessMu.Lock()
+		defer sessMu.Unlock()
+		s := sessions[id]
+		if s == nil {
+			t.Fatalf("missing session %s", id)
+		}
+		return s.CapturedCode, s.CapturedSecret
+	}
+	ticketOf := func(id string) string {
+		t.Helper()
+		sessMu.Lock()
+		defer sessMu.Unlock()
+		s := sessions[id]
+		if s == nil || s.TicketID == "" {
+			t.Fatalf("missing ticket for %s", id)
+		}
+		return s.TicketID
+	}
+	clearSessions := func() {
+		sessMu.Lock()
+		sessions = map[string]*loginSession{}
+		sessMu.Unlock()
+	}
+
+	older := start()
+	newer := start()
+	if older.State == newer.State {
+		t.Fatal("login states collided")
+	}
+
+	applyPastedCallback("http://127.0.0.1:18080/oauth/callback?code=loose-code&secret=portal-secret-unmatched")
+	rec := httptest.NewRecorder()
+	handleOAuthCallbackHTTP(rec, httptest.NewRequest(http.MethodGet, "/oauth/callback?code=http-loose-code&secret=portal-secret-http", nil))
+	if !strings.Contains(rec.Body.String(), "已接收授权码") {
+		t.Fatalf("unbound code callback body:\n%s", rec.Body.String())
+	}
+	for _, id := range []string{older.State, newer.State} {
+		code, secret := snap(id)
+		if code != "" || secret != "" {
+			t.Fatalf("session %s stored unbound callback code=%q secret=%q", id, code, secret)
+		}
+	}
+
+	applyPastedCallback("http://127.0.0.1:18080/oauth/callback?code=older-code&state=" + url.QueryEscape(older.State))
+	if code, secret := snap(older.State); code != "older-code" || secret != "" {
+		t.Fatalf("older after state bind code=%q secret=%q", code, secret)
+	}
+	if code, secret := snap(newer.State); code != "" || secret != "" {
+		t.Fatalf("newer stored state-bound callback code=%q secret=%q", code, secret)
+	}
+
+	olderTicket := ticketOf(older.State)
+	q := url.Values{}
+	q.Set("secret", "portal-secret-older")
+	q.Set("ticket_id", olderTicket)
+	handleOAuthCallbackHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/oauth/callback?"+q.Encode(), nil))
+	if code, secret := snap(older.State); code != "older-code" || secret != "portal-secret-older" {
+		t.Fatalf("older after ticket bind code=%q secret=%q", code, secret)
+	}
+	if code, secret := snap(newer.State); code != "" || secret != "" {
+		t.Fatalf("newer stored ticket-bound callback code=%q secret=%q", code, secret)
+	}
+
+	q = url.Values{}
+	q.Set("code", "different-code")
+	q.Set("state", older.State)
+	handleOAuthCallbackHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/oauth/callback?"+q.Encode(), nil))
+	if code, secret := snap(older.State); code != "older-code" || secret != "portal-secret-older" {
+		t.Fatalf("second code overwrote capture code=%q secret=%q", code, secret)
+	}
+	if code, secret := snap(newer.State); code != "" || secret != "" {
+		t.Fatalf("overwrite callback touched newer code=%q secret=%q", code, secret)
+	}
+
+	q = url.Values{}
+	q.Set("secret", "other-portal-secret")
+	q.Set("ticket_id", olderTicket)
+	handleOAuthCallbackHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/oauth/callback?"+q.Encode(), nil))
+	if _, secret := snap(older.State); secret != "portal-secret-older" {
+		t.Fatalf("second secret overwrote capture: %q", secret)
+	}
+
+	clearSessions()
+	bodyOlder := start()
+	bodyNewer := start()
+	body := url.Values{}
+	body.Set("code", "body-code")
+	body.Set("ticket_id", ticketOf(bodyOlder.State))
+	req := httptest.NewRequest(http.MethodPost, "/oauth/callback?secret=from-query", strings.NewReader(body.Encode()))
+	handleOAuthCallbackHTTP(httptest.NewRecorder(), req)
+	if code, secret := snap(bodyOlder.State); code != "body-code" || secret != "from-query" {
+		t.Fatalf("merged body callback code=%q secret=%q", code, secret)
+	}
+	if code, secret := snap(bodyNewer.State); code != "" || secret != "" {
+		t.Fatalf("merged body callback touched newer code=%q secret=%q", code, secret)
+	}
+
+	clearSessions()
+	only := start()
+	handleOAuthCallbackHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/oauth/callback?code=should-drop&state=missing-state", nil))
+	handleOAuthCallbackHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/oauth/callback?code=should-drop-ticket&ticket_id=missing-ticket", nil))
+	if code, secret := snap(only.State); code != "" || secret != "" {
+		t.Fatalf("unknown state or ticket attached to the sole session code=%q secret=%q", code, secret)
+	}
+	applyPastedCallback("http://127.0.0.1:18080/oauth/callback?code=sole-code")
+	if code, _ := snap(only.State); code != "sole-code" {
+		t.Fatalf("sole session did not bind code: %q", code)
+	}
+}
+
 func TestManagementRegisterHasNoPluginPage(t *testing.T) {
 	resetForTest(t)
 	reg := resultMap(t, pluginabi.MethodManagementRegister, nil)

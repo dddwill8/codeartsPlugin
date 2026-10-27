@@ -358,33 +358,55 @@ func gcSessionsLocked() {
 	}
 }
 
-func captureCallback(code, secret string) {
+// captureCallback binds a callback to one in-flight session.
+// A non-empty state selects only sessions[state]. Otherwise a non-empty
+// ticketID selects only that TicketID. With neither, it binds only when
+// exactly one session is in flight. Any other callback is discarded.
+// A non-empty CapturedCode or CapturedSecret is not replaced by a different value.
+func captureCallback(code, secret, state, ticketID string) *loginSession {
 	if code == "" && secret == "" {
-		return
+		return nil
 	}
 	sessMu.Lock()
 	defer sessMu.Unlock()
-	var latest *loginSession
-	for _, s := range sessions {
-		if secret != "" && s.Secret == secret {
-			if code != "" {
-				s.CapturedCode = code
+	gcSessionsLocked()
+	sess := matchCallbackSessionLocked(state, ticketID)
+	if sess == nil {
+		return nil
+	}
+	if code != "" && (sess.CapturedCode == "" || sess.CapturedCode == code) {
+		sess.CapturedCode = code
+	}
+	if secret != "" && (sess.CapturedSecret == "" || sess.CapturedSecret == secret) {
+		sess.CapturedSecret = secret
+	}
+	return sess
+}
+
+func matchCallbackSessionLocked(state, ticketID string) *loginSession {
+	if state != "" {
+		return sessions[state]
+	}
+	if ticketID != "" {
+		var found *loginSession
+		for _, s := range sessions {
+			if s.TicketID != ticketID {
+				continue
 			}
-			s.CapturedSecret = secret
-			return
+			if found != nil {
+				return nil
+			}
+			found = s
 		}
-		if latest == nil || s.CreatedAt.After(latest.CreatedAt) {
-			latest = s
-		}
+		return found
 	}
-	if latest != nil {
-		if code != "" {
-			latest.CapturedCode = code
-		}
-		if secret != "" {
-			latest.CapturedSecret = secret
-		}
+	if len(sessions) != 1 {
+		return nil
 	}
+	for _, s := range sessions {
+		return s
+	}
+	return nil
 }
 
 func latestSession() *loginSession {
