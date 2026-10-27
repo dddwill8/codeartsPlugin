@@ -28,6 +28,9 @@ type loginSession struct {
 	CapturedCode     string
 	CapturedSecret   string
 	CapturedRedirect string
+	// claimedCodes are authorization codes this session already handed to
+	// exchangeCode. The same value must not be stored in CapturedCode again.
+	claimedCodes map[string]struct{}
 }
 
 var (
@@ -488,12 +491,16 @@ func getSession(id string) *loginSession {
 }
 
 // claimCaptured copies CapturedCode and CapturedSecret. A non-empty code is
-// cleared before sessMu is released so this poll owns it. CapturedSecret is
-// left in place. Do not hold sessMu across hostHTTPDo.
+// recorded in claimedCodes and cleared before sessMu is released so this poll
+// owns it. CapturedSecret is left in place. Do not hold sessMu across hostHTTPDo.
 func claimCaptured(sess *loginSession) (code, secret string) {
 	sessMu.Lock()
 	code, secret = sess.CapturedCode, sess.CapturedSecret
 	if code != "" {
+		if sess.claimedCodes == nil {
+			sess.claimedCodes = map[string]struct{}{}
+		}
+		sess.claimedCodes[code] = struct{}{}
 		sess.CapturedCode = ""
 	}
 	sessMu.Unlock()
@@ -716,6 +723,7 @@ func parseOAuthCodeFile(raw []byte) (code, state, oauthErr string) {
 // A non-empty state selects only sessions[state]. Otherwise a non-empty
 // ticketID selects only that TicketID. With neither, it binds only when
 // exactly one session is in flight. Any other callback is discarded.
+// A code already claimed by this session is not written to CapturedCode.
 // A non-empty CapturedCode or CapturedSecret is not replaced by a different value.
 func captureCallback(code, secret, state, ticketID string) *loginSession {
 	if code == "" && secret == "" {
@@ -728,8 +736,11 @@ func captureCallback(code, secret, state, ticketID string) *loginSession {
 	if sess == nil {
 		return nil
 	}
-	if code != "" && (sess.CapturedCode == "" || sess.CapturedCode == code) {
-		sess.CapturedCode = code
+	if code != "" {
+		_, claimed := sess.claimedCodes[code]
+		if !claimed && (sess.CapturedCode == "" || sess.CapturedCode == code) {
+			sess.CapturedCode = code
+		}
 	}
 	if secret != "" && (sess.CapturedSecret == "" || sess.CapturedSecret == secret) {
 		sess.CapturedSecret = secret
