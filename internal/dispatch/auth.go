@@ -224,7 +224,7 @@ func handleRefresh(request []byte) ([]byte, error) {
 	}
 	_ = hostAuthSave(fileName, rawNext)
 	exp, _ := time.Parse(time.RFC3339, next.Expiration)
-	nextRefresh := time.Now().UTC().Add(50 * time.Minute)
+	nextRefresh := time.Now().UTC().Add(10 * time.Minute)
 	if !exp.IsZero() {
 		nextRefresh = exp.Add(-5 * time.Minute)
 	}
