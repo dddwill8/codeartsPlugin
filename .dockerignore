@@ -1,0 +1,6 @@
+plugins
+deploy/cpa/auths
+deploy/cpa/logs
+.git
+*.so
+*.h

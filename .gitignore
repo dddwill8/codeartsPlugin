@@ -1,0 +1,22 @@
+# Build artifacts
+*.so
+*.dylib
+*.dll
+*.h
+/bin/
+/dist/
+/plugins/linux/
+/plugins/darwin/
+/plugins/windows/
+
+# CPA runtime (local compose)
+/deploy/cpa/auths/
+/deploy/cpa/logs/
+/deploy/cpa/data/
+/deploy/cpa/panel/management.html
+
+# Go
+/vendor/
+
+# macOS
+.DS_Store
