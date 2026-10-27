@@ -223,11 +223,6 @@ func handleRefresh(request []byte) ([]byte, error) {
 		return errorEnvelope("refresh_error", err.Error(), http.StatusInternalServerError), nil
 	}
 	_ = hostAuthSave(fileName, rawNext)
-	exp, _ := time.Parse(time.RFC3339, next.Expiration)
-	nextRefresh := time.Now().UTC().Add(10 * time.Minute)
-	if !exp.IsZero() {
-		nextRefresh = exp.Add(-5 * time.Minute)
-	}
 	auth := authDataFromCredential(next, fileName)
 	auth.ID = jsonString(request, "AuthID", "auth_id")
 	if auth.ID == "" {
@@ -235,7 +230,7 @@ func handleRefresh(request []byte) ([]byte, error) {
 	}
 	return okEnvelope(pluginapi.AuthRefreshResponse{
 		Auth:             auth,
-		NextRefreshAfter: nextRefresh,
+		NextRefreshAfter: auth.NextRefreshAfter,
 	})
 }
 
@@ -318,18 +313,38 @@ func authDataFromCredential(c protocol.Credential, fileName string) pluginapi.Au
 		label = "CodeArts"
 	}
 	id := fileName
-	return pluginapi.AuthData{
-		Provider:    protocol.Provider,
-		ID:          id,
-		FileName:    fileName,
-		Label:       label,
-		StorageJSON: raw,
-		Metadata: map[string]any{
-			"type":      protocol.Provider,
-			"user_id":   c.UserID,
-			"user_name": c.UserName,
-		},
+	meta := map[string]any{
+		"type":      protocol.Provider,
+		"user_id":   c.UserID,
+		"user_name": c.UserName,
+		// codearts has no ProviderRefreshLead; CPA schedules refresh only when this is positive.
+		"refresh_interval_seconds": 600,
 	}
+	if c.Expiration != "" {
+		meta["expires_at"] = c.Expiration
+	}
+	if c.RefreshToken != "" {
+		meta["refresh_token"] = c.RefreshToken
+	}
+	return pluginapi.AuthData{
+		Provider:         protocol.Provider,
+		ID:               id,
+		FileName:         fileName,
+		Label:            label,
+		StorageJSON:      raw,
+		Metadata:         meta,
+		NextRefreshAfter: nextRefreshFromExpiration(c.Expiration),
+	}
+}
+
+// nextRefreshFromExpiration is a parseable expiration minus 5 minutes.
+// An empty or unparseable expiration is now plus 10 minutes.
+func nextRefreshFromExpiration(expiration string) time.Time {
+	exp, err := time.Parse(time.RFC3339, expiration)
+	if err != nil || exp.IsZero() {
+		return time.Now().UTC().Add(10 * time.Minute)
+	}
+	return exp.Add(-5 * time.Minute)
 }
 
 func putSession(s *loginSession) {
