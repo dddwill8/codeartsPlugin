@@ -3,7 +3,10 @@ package dispatch
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -132,6 +135,9 @@ func handleLoginPoll(request []byte) ([]byte, error) {
 			Message: "login flow expired",
 		})
 	}
+	// Paste and .oauth-codearts-<state>.oauth are the inputs the loopback
+	// listener would have stored. Binding stays inside captureCallback.
+	ingestPollCallback(request, state)
 	lc := loginConfig()
 	callbackID := jsonString(request, "host_callback_id", "HostCallbackID")
 	capturedCode, capturedSecret := claimCaptured(sess)
@@ -507,6 +513,203 @@ func gcSessionsLocked() {
 			delete(sessions, id)
 		}
 	}
+}
+
+// ingestPollCallback stores callback material carried on this poll.
+// A parsed callback with neither state nor ticket_id is for this poll.
+// A different state is passed through and is not rewritten onto the poll.
+func ingestPollCallback(request []byte, pollState string) {
+	if len(request) == 0 || pollState == "" {
+		return
+	}
+	var root map[string]any
+	if err := json.Unmarshal(request, &root); err != nil || root == nil {
+		return
+	}
+	if parts := callbackPartsFromPoll(root); parts.Code != "" || parts.Secret != "" {
+		bindState := parts.State
+		bindTicket := parts.TicketID
+		if bindState == "" && bindTicket == "" {
+			bindState = pollState
+		}
+		captureCallback(parts.Code, parts.Secret, bindState, bindTicket)
+	}
+	if dir := pollAuthDir(root); dir != "" {
+		captureAuthDirCode(dir, pollState)
+	}
+}
+
+func callbackPartsFromPoll(root map[string]any) protocol.CallbackParts {
+	sources := []map[string]any{root}
+	if meta := nestedObject(root, "Metadata", "metadata"); meta != nil {
+		sources = append(sources, meta)
+	}
+	var parts protocol.CallbackParts
+	var parsedURLs []string
+	for _, src := range sources {
+		for _, key := range []string{"redirect_url", "url", "callback_url", "callback"} {
+			raw := pollString(src, key)
+			if raw == "" {
+				continue
+			}
+			parsedURLs = append(parsedURLs, raw)
+			parts = fillCallbackParts(parts, protocol.ParseCallback(raw))
+		}
+		code := pollString(src, "code")
+		if code == "" {
+			continue
+		}
+		if strings.Contains(code, "://") || strings.Contains(code, "code=") || strings.Contains(code, "secret=") {
+			parsedURLs = append(parsedURLs, code)
+			parts = fillCallbackParts(parts, protocol.ParseCallback(code))
+			continue
+		}
+		if parts.Code == "" {
+			parts.Code = code
+		}
+	}
+	for _, src := range sources {
+		secret := pollString(src, "secret")
+		if secret == "" || parts.Secret != "" {
+			continue
+		}
+		// Already extracted from a pasted URL; do not layer a second secret.
+		if secretInside(parsedURLs, secret) {
+			continue
+		}
+		parts.Secret = secret
+		break
+	}
+	return parts
+}
+
+func fillCallbackParts(dst, src protocol.CallbackParts) protocol.CallbackParts {
+	if dst.Code == "" {
+		dst.Code = src.Code
+	}
+	if dst.Secret == "" {
+		dst.Secret = src.Secret
+	}
+	if dst.Redirect == "" {
+		dst.Redirect = src.Redirect
+	}
+	if dst.State == "" {
+		dst.State = src.State
+	}
+	if dst.TicketID == "" {
+		dst.TicketID = src.TicketID
+	}
+	return dst
+}
+
+func secretInside(urls []string, secret string) bool {
+	for _, raw := range urls {
+		if strings.Contains(raw, secret) {
+			return true
+		}
+	}
+	return false
+}
+
+func pollAuthDir(root map[string]any) string {
+	if host := nestedObject(root, "Host"); host != nil {
+		if dir := pollString(host, "AuthDir"); dir != "" {
+			return dir
+		}
+	}
+	if host := nestedObject(root, "host"); host != nil {
+		if dir := pollString(host, "auth_dir"); dir != "" {
+			return dir
+		}
+	}
+	return ""
+}
+
+func nestedObject(m map[string]any, keys ...string) map[string]any {
+	if m == nil {
+		return nil
+	}
+	for _, key := range keys {
+		child, ok := m[key].(map[string]any)
+		if ok && child != nil {
+			return child
+		}
+	}
+	return nil
+}
+
+func pollString(m map[string]any, key string) string {
+	if m == nil {
+		return ""
+	}
+	s, ok := m[key].(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(s)
+}
+
+// captureAuthDirCode reads {AuthDir}/.oauth-codearts-{state}.oauth only.
+// The state component must be [A-Za-z0-9]. A missing file is not an error.
+// A non-empty file state other than this poll is ignored. An error with an
+// empty code is not exchanged.
+func captureAuthDirCode(authDir, pollState string) {
+	if !oauthStateFileToken(pollState) {
+		return
+	}
+	path := filepath.Join(authDir, ".oauth-codearts-"+pollState+".oauth")
+	f, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	raw, err := io.ReadAll(io.LimitReader(f, 64<<10))
+	if err != nil {
+		return
+	}
+	code, fileState, fileErr := parseOAuthCodeFile(raw)
+	if fileState != "" && fileState != pollState {
+		return
+	}
+	if fileErr != "" && code == "" {
+		return
+	}
+	if code == "" {
+		return
+	}
+	captureCallback(code, "", pollState, "")
+}
+
+func oauthStateFileToken(state string) bool {
+	if state == "" {
+		return false
+	}
+	for i := 0; i < len(state); i++ {
+		c := state[i]
+		if (c < 'A' || c > 'Z') && (c < 'a' || c > 'z') && (c < '0' || c > '9') {
+			return false
+		}
+	}
+	return true
+}
+
+func parseOAuthCodeFile(raw []byte) (code, state, oauthErr string) {
+	trim := strings.TrimSpace(string(raw))
+	if trim == "" {
+		return "", "", ""
+	}
+	if trim[0] == '{' {
+		var obj struct {
+			Code  string `json:"code"`
+			State string `json:"state"`
+			Error string `json:"error"`
+		}
+		if err := json.Unmarshal([]byte(trim), &obj); err == nil {
+			return strings.TrimSpace(obj.Code), strings.TrimSpace(obj.State), strings.TrimSpace(obj.Error)
+		}
+	}
+	parts := protocol.ParseCallback(trim)
+	return strings.TrimSpace(parts.Code), strings.TrimSpace(parts.State), ""
 }
 
 // captureCallback binds a callback to one in-flight session.
