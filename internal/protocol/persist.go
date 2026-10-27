@@ -182,9 +182,15 @@ func MarshalCredential(c Credential) ([]byte, error) {
 }
 
 // LooksLikeCodeArts reports whether raw JSON is a CodeArts auth file.
+// Type is read from the raw object. ParseCredential still defaults an empty
+// type for credentials this plugin already owns; that default must not claim
+// a file whose type is missing or blank.
 func LooksLikeCodeArts(raw []byte, fileName string) bool {
-	c, err := ParseCredential(raw)
-	if err != nil {
+	if len(raw) == 0 {
+		return false
+	}
+	var c Credential
+	if err := json.Unmarshal(raw, &c); err != nil {
 		return false
 	}
 	if strings.EqualFold(c.Type, Provider) {

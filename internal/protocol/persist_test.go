@@ -115,3 +115,38 @@ func TestApplyRefreshKeepsClientIDAndDPoPRotatesSTS(t *testing.T) {
 		t.Fatalf("json refresh_token = %v", obj["refresh_token"])
 	}
 }
+
+func TestLooksLikeCodeArts(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  []byte
+		file string
+		want bool
+	}{
+		{name: "nil body", raw: nil, want: false},
+		{name: "empty body", raw: []byte{}, want: false},
+		{name: "invalid json", raw: []byte(`{`), want: false},
+		{name: "json null", raw: []byte(`null`), want: false},
+		{name: "no keys", raw: []byte(`{}`), want: false},
+		{name: "empty type", raw: []byte(`{"type":""}`), want: false},
+		{name: "null type", raw: []byte(`{"type":null}`), want: false},
+		{name: "missing type with keys", raw: []byte(`{"access_key_id":"AK","secret_access_key":"SK"}`), want: false},
+		{name: "explicit codearts no keys", raw: []byte(`{"type":"codearts"}`), want: true},
+		{name: "explicit CodeArts", raw: []byte(`{"type":"CodeArts"}`), want: true},
+		{name: "explicit CODEARTS", raw: []byte(`{"type":"CODEARTS"}`), want: true},
+		{name: "other type", raw: []byte(`{"type":"other"}`), want: false},
+		{name: "filename other type", raw: []byte(`{"type":"other","access_key_id":"AK"}`), file: "codearts-ak.json", want: true},
+		{name: "filename empty type no secret", raw: []byte(`{"type":"","access_key_id":"AK"}`), file: "codearts-ak.json", want: true},
+		{name: "filename missing type", raw: []byte(`{"access_key_id":"AK"}`), file: "CODEARTS-User.JSON", want: true},
+		{name: "filename without ak", raw: []byte(`{"type":""}`), file: "codearts-ak.json", want: false},
+		{name: "filename empty ak", raw: []byte(`{"access_key_id":""}`), file: "codearts-ak.json", want: false},
+		{name: "other file no type", raw: []byte(`{"access_key_id":"AK"}`), file: "other.json", want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := LooksLikeCodeArts(tc.raw, tc.file); got != tc.want {
+				t.Fatalf("LooksLikeCodeArts(%s, %q) = %v, want %v", tc.raw, tc.file, got, tc.want)
+			}
+		})
+	}
+}
