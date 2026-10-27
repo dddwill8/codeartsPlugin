@@ -217,8 +217,14 @@ func AccountKey(c Credential) string {
 }
 
 // FileNameFor returns the host auth file name for this credential.
+// User id wins when set. Otherwise the access key is used so accounts that
+// omit user_id do not share one file. The access key is not prefixed with
+// ak:; that form belongs only to AccountKey.
 func FileNameFor(c Credential) string {
 	id := strings.TrimSpace(c.UserID)
+	if id == "" {
+		id = strings.TrimSpace(c.AccessKeyID)
+	}
 	if id == "" {
 		id = "unknown"
 	}

@@ -147,7 +147,7 @@ func handleLoginPoll(request []byte) ([]byte, error) {
 				Message: "authorization code rejected: " + err.Error() + "; paste a new callback URL or reset login",
 			})
 		}
-		return completeLogin(sess, tok)
+		return completeLogin(sess, tok, callbackID)
 	}
 
 	// Ticket GET is not DPoP-bound. Completing on ticket STS would persist
@@ -215,8 +215,11 @@ func handleRefresh(request []byte) ([]byte, error) {
 	}
 	next := protocol.ApplyRefresh(prev, tok)
 	fileName := jsonString(request, "FileName", "file_name")
-	if fileName == "" {
-		fileName = protocol.FileNameFor(next)
+	derived := protocol.FileNameFor(next)
+	// An omitted name or the shared unknown placeholder follows the credential.
+	// Any other caller-supplied name stays, even when it differs from derived.
+	if (fileName == "" || fileName == "codearts-unknown.json") && derived != fileName {
+		fileName = derived
 	}
 	rawNext, err := protocol.MarshalCredential(next)
 	if err != nil {
@@ -234,12 +237,15 @@ func handleRefresh(request []byte) ([]byte, error) {
 	})
 }
 
-func completeLogin(sess *loginSession, tok protocol.TokenResponse) ([]byte, error) {
+func completeLogin(sess *loginSession, tok protocol.TokenResponse, callbackID string) ([]byte, error) {
 	if !tok.HasSTS() || strings.TrimSpace(tok.RefreshToken) == "" {
 		return errorEnvelope("login_error", "refusing to persist STS without DPoP-bound refresh_token", http.StatusUnauthorized), nil
 	}
 	lc := loginConfig()
 	cred := protocol.NewCredentialFromToken(tok, sess.Verifier, lc.ClientID, sess.DPoP)
+	if strings.TrimSpace(cred.UserID) == "" {
+		fillCredentialIdentity(callbackID, lc, &cred)
+	}
 	raw, err := protocol.MarshalCredential(cred)
 	if err != nil {
 		return errorEnvelope("login_error", err.Error(), http.StatusInternalServerError), nil
@@ -252,6 +258,120 @@ func completeLogin(sess *loginSession, tok protocol.TokenResponse) ([]byte, erro
 		Message: "CodeArts login complete",
 		Auth:    authDataFromCredential(cred, fileName),
 	})
+}
+
+// fillCredentialIdentity GETs snap-manager current user, then STS caller
+// identity, only while user_id is empty. Either call failing or returning
+// nothing still leaves the access key as the file name.
+func fillCredentialIdentity(callbackID string, lc protocol.LoginConfig, cred *protocol.Credential) {
+	if cred == nil || strings.TrimSpace(cred.UserID) != "" {
+		return
+	}
+	if body, ok := signedIdentityGET(callbackID, snapManagerBase(lc)+protocol.EpCurrentUser, *cred); ok {
+		applyCurrentUser(cred, body)
+	}
+	if strings.TrimSpace(cred.UserID) != "" {
+		return
+	}
+	if body, ok := signedIdentityGET(callbackID, stsBase(lc)+protocol.EpCallerIdentity, *cred); ok {
+		applyCallerIdentity(cred, body)
+	}
+}
+
+func snapManagerBase(lc protocol.LoginConfig) string {
+	host := strings.TrimSpace(lc.SnapManager)
+	if host == "" {
+		host = protocol.SnapManagerHost
+	}
+	return strings.TrimRight(host, "/")
+}
+
+func stsBase(lc protocol.LoginConfig) string {
+	host := strings.TrimSpace(lc.STSHost)
+	if host == "" {
+		host = protocol.STSHost
+	}
+	return strings.TrimRight(host, "/")
+}
+
+func signedIdentityGET(callbackID, rawURL string, cred protocol.Credential) ([]byte, bool) {
+	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	if err != nil || req.URL == nil || req.URL.Host == "" {
+		return nil, false
+	}
+	protocol.SignRequest(req, nil, protocol.SignCredentialFrom(cred), protocol.SignOptions{})
+	resp, err := hostHTTPDo(callbackID, req)
+	if err != nil {
+		return nil, false
+	}
+	defer resp.Body.Close()
+	body, _ := protocol.ReadAllLimited(resp.Body, 4<<20)
+	if resp.StatusCode >= 400 {
+		return nil, false
+	}
+	return body, true
+}
+
+func applyCurrentUser(cred *protocol.Credential, body []byte) {
+	if cred == nil {
+		return
+	}
+	objs := jsonObjects(body, "user", "result")
+	setIfEmpty(&cred.UserID, firstStringField(objs, "user_id", "userId"))
+	setIfEmpty(&cred.UserName, firstStringField(objs, "user_name", "userName"))
+	setIfEmpty(&cred.DomainID, firstStringField(objs, "domain_id", "domainId"))
+}
+
+func applyCallerIdentity(cred *protocol.Credential, body []byte) {
+	if cred == nil {
+		return
+	}
+	objs := jsonObjects(body, "result")
+	id := firstStringField(objs, "principal_id")
+	if id == "" {
+		id = firstStringField(objs, "account_id")
+	}
+	setIfEmpty(&cred.UserID, id)
+	setIfEmpty(&cred.UserName, firstStringField(objs, "user_name", "userName"))
+}
+
+func jsonObjects(body []byte, nested ...string) []map[string]any {
+	var root map[string]any
+	if err := json.Unmarshal(body, &root); err != nil || root == nil {
+		return nil
+	}
+	out := []map[string]any{root}
+	for _, key := range nested {
+		child, ok := root[key].(map[string]any)
+		if !ok {
+			continue
+		}
+		out = append(out, child)
+	}
+	return out
+}
+
+func firstStringField(objs []map[string]any, keys ...string) string {
+	for _, key := range keys {
+		for _, obj := range objs {
+			v, ok := obj[key].(string)
+			if !ok {
+				continue
+			}
+			v = strings.TrimSpace(v)
+			if v != "" {
+				return v
+			}
+		}
+	}
+	return ""
+}
+
+func setIfEmpty(dst *string, val string) {
+	if dst == nil || strings.TrimSpace(*dst) != "" || strings.TrimSpace(val) == "" {
+		return
+	}
+	*dst = strings.TrimSpace(val)
 }
 
 func exchangeCode(callbackID string, lc protocol.LoginConfig, sess *loginSession, code string) (protocol.TokenResponse, error) {

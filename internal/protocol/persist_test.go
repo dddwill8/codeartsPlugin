@@ -2,8 +2,35 @@ package protocol
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
+
+func TestFileNameForEmptyUserIDUsesAccessKey(t *testing.T) {
+	a := FileNameFor(Credential{UserID: "", AccessKeyID: "AKID-a"})
+	b := FileNameFor(Credential{UserID: "  ", AccessKeyID: "AKID-b"})
+	if a != "codearts-AKID-a.json" || b != "codearts-AKID-b.json" {
+		t.Fatalf("access key names = %q %q", a, b)
+	}
+	if a == "codearts-unknown.json" || b == "codearts-unknown.json" {
+		t.Fatal("distinct accounts collapsed to codearts-unknown.json")
+	}
+	if strings.Contains(a, "ak:") || strings.Contains(b, "ak:") {
+		t.Fatalf("access key must not be prefixed: %q %q", a, b)
+	}
+	if got := FileNameFor(Credential{UserID: "u1", AccessKeyID: "AKID-a"}); got != "codearts-u1.json" {
+		t.Fatalf("user id should win: %q", got)
+	}
+	if got := FileNameFor(Credential{UserID: " usr/id "}); got != "codearts-usr_id.json" {
+		t.Fatalf("trimmed user id with slash = %q", got)
+	}
+	if got := FileNameFor(Credential{AccessKeyID: " AK/ID "}); got != "codearts-AK_ID.json" {
+		t.Fatalf("trimmed access key with slash = %q", got)
+	}
+	if got := FileNameFor(Credential{}); got != "codearts-unknown.json" {
+		t.Fatalf("both empty = %q", got)
+	}
+}
 
 func TestAccountKeyFallsBackToAccessKeyWhenUserIDEmpty(t *testing.T) {
 	if got := AccountKey(Credential{UserID: "u1", AccessKeyID: "AK"}); got != "u1" {
