@@ -32,12 +32,41 @@ type loginSession struct {
 	// claimedCodes are authorization codes this session already handed to
 	// exchangeCode. The same value must not be stored in CapturedCode again.
 	claimedCodes map[string]struct{}
+	// exchanging is true while this session is inside exchangeCode.
+	// exchangeFailed is set when that call rejected the code and no newer
+	// code was stored.
+	exchanging     bool
+	exchangeFailed bool
+}
+
+// loginTerminal is what remains after a session is deleted, until ExpiresAt.
+// It records success and a display name only. It must not hold an authorization
+// code, secret, refresh token, or STS.
+type loginTerminal struct {
+	ExpiresAt time.Time
+	OK        bool
+	Label     string
 }
 
 var (
-	sessMu   sync.Mutex
-	sessions = map[string]*loginSession{}
+	sessMu          sync.Mutex
+	sessions        = map[string]*loginSession{}
+	retiredSessions = map[string]time.Time{}
+	loginTerminals  = map[string]loginTerminal{}
 )
+
+type statusError struct {
+	Code   string
+	Status int
+	Msg    string
+}
+
+func (e *statusError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return e.Msg
+}
 
 func handleAuthParse(request []byte) ([]byte, error) {
 	var req pluginapi.AuthParseRequest
@@ -66,23 +95,44 @@ func handleAuthParse(request []byte) ([]byte, error) {
 }
 
 func handleLoginStart(_ []byte) ([]byte, error) {
+	sess, err := beginLoginSession()
+	if err != nil {
+		return errorEnvelope("login_error", err.Error(), http.StatusInternalServerError), nil
+	}
+	lc := loginConfig()
+	return okEnvelope(pluginapi.AuthLoginStartResponse{
+		Provider:  protocol.Provider,
+		URL:       sess.AuthURL,
+		State:     sess.ID,
+		ExpiresAt: sess.ExpiresAt,
+		Metadata: map[string]any{
+			"ticket_id":     sess.TicketID,
+			"callback_path": protocol.RedirectURI(lc, sess.Port),
+		},
+	})
+}
+
+// beginLoginSession builds the one in-flight login: PKCE, DPoP, and putSession.
+// The state stays in the plugin. It is not written to CPA's OAuth session table.
+// A later call replaces that session. The previous authorization code is not copied.
+func beginLoginSession() (*loginSession, error) {
 	cfg := currentConfig()
 	lc := loginConfig()
 	ticketID, err := protocol.RandomHex(16)
 	if err != nil {
-		return errorEnvelope("login_error", err.Error(), http.StatusInternalServerError), nil
+		return nil, err
 	}
 	secret, err := protocol.RandomHex(16)
 	if err != nil {
-		return errorEnvelope("login_error", err.Error(), http.StatusInternalServerError), nil
+		return nil, err
 	}
 	verifier, challenge, err := protocol.PKCE()
 	if err != nil {
-		return errorEnvelope("login_error", err.Error(), http.StatusInternalServerError), nil
+		return nil, err
 	}
 	dpop, err := protocol.NewDPoPPrivateJWK()
 	if err != nil {
-		return errorEnvelope("login_error", err.Error(), http.StatusInternalServerError), nil
+		return nil, err
 	}
 	port := cfg.CallbackPort
 	if port <= 0 {
@@ -90,9 +140,8 @@ func handleLoginStart(_ []byte) ([]byte, error) {
 	}
 	state, err := protocol.RandomHex(16)
 	if err != nil {
-		return errorEnvelope("login_error", err.Error(), http.StatusInternalServerError), nil
+		return nil, err
 	}
-	authURL := protocol.BuildAuthorizeURL(lc, ticketID, challenge, port)
 	now := time.Now().UTC()
 	sess := &loginSession{
 		ID:        state,
@@ -101,22 +150,13 @@ func handleLoginStart(_ []byte) ([]byte, error) {
 		Verifier:  verifier,
 		DPoP:      dpop,
 		Port:      port,
-		AuthURL:   authURL,
+		AuthURL:   protocol.BuildAuthorizeURL(lc, ticketID, challenge, port),
 		CreatedAt: now,
 		ExpiresAt: now.Add(15 * time.Minute),
 	}
 	putSession(sess)
 	ensureCallbackListener(cfg)
-	return okEnvelope(pluginapi.AuthLoginStartResponse{
-		Provider:  protocol.Provider,
-		URL:       authURL,
-		State:     state,
-		ExpiresAt: sess.ExpiresAt,
-		Metadata: map[string]any{
-			"ticket_id":     ticketID,
-			"callback_path": protocol.RedirectURI(lc, port),
-		},
-	})
+	return sess, nil
 }
 
 func handleLoginPoll(request []byte) ([]byte, error) {
@@ -141,28 +181,32 @@ func handleLoginPoll(request []byte) ([]byte, error) {
 	}
 	// Paste and .oauth-codearts-<state>.oauth are the inputs the loopback
 	// listener would have stored. Binding stays inside captureCallback.
+	// The listener does not exchange; this poll does, once.
 	ingestPollCallback(request, state)
 	lc := loginConfig()
 	callbackID := jsonString(request, "host_callback_id", "HostCallbackID")
-	capturedCode, capturedSecret := claimCaptured(sess)
-
-	if capturedCode != "" {
-		tok, err := exchangeCode(callbackID, lc, sess, capturedCode)
-		if err != nil {
-			// The code was claimed before exchange. Do not clear CapturedCode
-			// again: captureCallback may have stored a newer code during the
-			// HTTP call, and that code must remain.
-			return okEnvelope(pluginapi.AuthLoginPollResponse{
-				Status:  pluginapi.AuthLoginStatusPending,
-				Message: "authorization code rejected: " + err.Error() + "; paste a new callback URL or reset login",
-			})
-		}
-		return completeLogin(sess, tok, callbackID)
+	out := redeemCaptured(sess, callbackID)
+	if out.Hard != nil {
+		return errorEnvelope(out.Hard.Code, out.Hard.Msg, out.Hard.Status), nil
+	}
+	if out.Exchanged {
+		return okEnvelope(pluginapi.AuthLoginPollResponse{
+			Status:  pluginapi.AuthLoginStatusSuccess,
+			Message: "CodeArts login complete",
+			Auth:    out.Auth,
+		})
+	}
+	if out.Rejected {
+		return okEnvelope(pluginapi.AuthLoginPollResponse{
+			Status:  pluginapi.AuthLoginStatusPending,
+			Message: "authorization code rejected: " + out.RejectReason + "; paste a new callback URL or reset login",
+		})
 	}
 
 	// Ticket GET is not DPoP-bound. Completing on ticket STS would persist
 	// sess.DPoP beside credentials whose refresh_token (if any) was issued
 	// without that key, and it races the authorization_code exchange.
+	capturedSecret := out.Secret
 	tok, err := pollTicket(callbackID, lc, sess, capturedSecret)
 	msg := "waiting for Huawei authorization code"
 	if capturedSecret != "" {
@@ -247,9 +291,66 @@ func handleRefresh(request []byte) ([]byte, error) {
 	})
 }
 
-func completeLogin(sess *loginSession, tok protocol.TokenResponse, callbackID string) ([]byte, error) {
+// redeemOutcome is one attempt to exchange a captured authorization code.
+// Poll, the management paste, and the management status query all use it.
+// claimCaptured makes the same code exchange at most once.
+type redeemOutcome struct {
+	Secret       string
+	Exchanged    bool
+	Rejected     bool
+	RejectReason string
+	Auth         pluginapi.AuthData
+	Label        string
+	Hard         *statusError
+	Busy         bool
+	// PriorFailure means an earlier exchange rejected the code and no newer
+	// code is waiting. This call did not exchange.
+	PriorFailure bool
+}
+
+func redeemCaptured(sess *loginSession, callbackID string) redeemOutcome {
+	code, secret := claimCaptured(sess)
+	out := redeemOutcome{Secret: secret}
+	if code == "" {
+		out.Busy = sessionBusy(sess)
+		out.PriorFailure = sessionExchangeFailed(sess)
+		return out
+	}
+	markExchanging(sess, true)
+	defer markExchanging(sess, false)
+	tok, err := exchangeCode(callbackID, loginConfig(), sess, code)
+	if err != nil {
+		// The code was claimed before exchange. Do not clear CapturedCode
+		// again: captureCallback may have stored a newer code during the
+		// HTTP call, and that code must remain.
+		out.Rejected = true
+		out.RejectReason = err.Error()
+		if !sessionHasCaptured(sess) {
+			markExchangeFailed(sess, true)
+		}
+		return out
+	}
+	auth, hard := finishLogin(sess, tok, callbackID)
+	if hard != nil {
+		out.Hard = hard
+		return out
+	}
+	out.Exchanged = true
+	out.Auth = auth
+	out.Label = auth.Label
+	return out
+}
+
+// finishLogin writes codearts-<user>.json through host.auth.save and drops the
+// session. host.auth.save is the same call auth.refresh uses to hand the
+// credential to CPA. A display-name terminal remains until ExpiresAt.
+func finishLogin(sess *loginSession, tok protocol.TokenResponse, callbackID string) (pluginapi.AuthData, *statusError) {
 	if !tok.HasSTS() || strings.TrimSpace(tok.RefreshToken) == "" {
-		return errorEnvelope("login_error", "refusing to persist STS without DPoP-bound refresh_token", http.StatusUnauthorized), nil
+		return pluginapi.AuthData{}, &statusError{
+			Code:   "login_error",
+			Status: http.StatusUnauthorized,
+			Msg:    "refusing to persist STS without DPoP-bound refresh_token",
+		}
 	}
 	lc := loginConfig()
 	cred := protocol.NewCredentialFromToken(tok, sess.Verifier, lc.ClientID, sess.DPoP)
@@ -258,16 +359,18 @@ func completeLogin(sess *loginSession, tok protocol.TokenResponse, callbackID st
 	}
 	raw, err := protocol.MarshalCredential(cred)
 	if err != nil {
-		return errorEnvelope("login_error", err.Error(), http.StatusInternalServerError), nil
+		return pluginapi.AuthData{}, &statusError{
+			Code:   "login_error",
+			Status: http.StatusInternalServerError,
+			Msg:    err.Error(),
+		}
 	}
 	fileName := protocol.FileNameFor(cred)
 	_ = hostAuthSave(fileName, raw)
+	auth := authDataFromCredential(cred, fileName)
+	rememberTerminal(sess, auth.Label)
 	delSession(sess.ID)
-	return okEnvelope(pluginapi.AuthLoginPollResponse{
-		Status:  pluginapi.AuthLoginStatusSuccess,
-		Message: "CodeArts login complete",
-		Auth:    authDataFromCredential(cred, fileName),
-	})
+	return auth, nil
 }
 
 // fillCredentialIdentity GETs snap-manager current user, then STS caller
@@ -480,9 +583,18 @@ func nextRefreshFromExpiration(expiration string) time.Time {
 func putSession(s *loginSession) {
 	sessMu.Lock()
 	defer sessMu.Unlock()
-	// One in-flight login. CPA cancel does not reach the plugin, so a previous
-	// attempt stays until it expires. Huawei then returns its own state, which
-	// matches none of those sessions, and the callback is dropped.
+	gcSessionsLocked()
+	// One in-flight login. A new attempt replaces the previous session.
+	// The previous authorization code stays on the old object and is not copied.
+	// Its id is retired so a later paste of that id cannot land on the new session.
+	for _, old := range sessions {
+		if old != nil && old.ID != s.ID {
+			retireSessionLocked(old)
+		}
+	}
+	if sessions == nil {
+		sessions = map[string]*loginSession{}
+	}
 	sessions = map[string]*loginSession{s.ID: s}
 }
 
@@ -512,17 +624,131 @@ func claimCaptured(sess *loginSession) (code, secret string) {
 
 func delSession(id string) {
 	sessMu.Lock()
+	if s := sessions[id]; s != nil {
+		retireSessionLocked(s)
+	}
 	delete(sessions, id)
 	sessMu.Unlock()
+}
+
+func rememberTerminal(sess *loginSession, label string) {
+	if sess == nil || sess.ID == "" {
+		return
+	}
+	sessMu.Lock()
+	defer sessMu.Unlock()
+	if loginTerminals == nil {
+		loginTerminals = map[string]loginTerminal{}
+	}
+	loginTerminals[sess.ID] = loginTerminal{
+		ExpiresAt: sess.ExpiresAt,
+		OK:        true,
+		Label:     label,
+	}
+}
+
+func terminalOf(id string) (loginTerminal, bool) {
+	sessMu.Lock()
+	defer sessMu.Unlock()
+	gcSessionsLocked()
+	term, ok := loginTerminals[id]
+	return term, ok
+}
+
+func retireSessionLocked(s *loginSession) {
+	if s == nil || s.ID == "" {
+		return
+	}
+	until := time.Now().Add(15 * time.Minute)
+	if s.ExpiresAt.After(until) {
+		until = s.ExpiresAt
+	}
+	if retiredSessions == nil {
+		retiredSessions = map[string]time.Time{}
+	}
+	if prev, ok := retiredSessions[s.ID]; ok && prev.After(until) {
+		return
+	}
+	retiredSessions[s.ID] = until
+}
+
+func isRetiredSession(id string) bool {
+	if id == "" {
+		return false
+	}
+	sessMu.Lock()
+	defer sessMu.Unlock()
+	// A session put back after a later login replaced it is in flight again.
+	if sessions[id] != nil {
+		return false
+	}
+	until, ok := retiredSessions[id]
+	if !ok {
+		return false
+	}
+	if time.Now().After(until) {
+		delete(retiredSessions, id)
+		return false
+	}
+	return true
 }
 
 func gcSessionsLocked() {
 	now := time.Now()
 	for id, s := range sessions {
 		if now.After(s.ExpiresAt) {
+			retireSessionLocked(s)
 			delete(sessions, id)
 		}
 	}
+	for id, until := range retiredSessions {
+		if now.After(until) {
+			delete(retiredSessions, id)
+		}
+	}
+	for id, term := range loginTerminals {
+		if now.After(term.ExpiresAt) {
+			delete(loginTerminals, id)
+		}
+	}
+}
+
+func clearLoginState() {
+	sessMu.Lock()
+	sessions = map[string]*loginSession{}
+	retiredSessions = map[string]time.Time{}
+	loginTerminals = map[string]loginTerminal{}
+	sessMu.Unlock()
+}
+
+func markExchanging(sess *loginSession, on bool) {
+	sessMu.Lock()
+	sess.exchanging = on
+	sessMu.Unlock()
+}
+
+func markExchangeFailed(sess *loginSession, failed bool) {
+	sessMu.Lock()
+	sess.exchangeFailed = failed
+	sessMu.Unlock()
+}
+
+func sessionBusy(sess *loginSession) bool {
+	sessMu.Lock()
+	defer sessMu.Unlock()
+	return sess.exchanging
+}
+
+func sessionExchangeFailed(sess *loginSession) bool {
+	sessMu.Lock()
+	defer sessMu.Unlock()
+	return sess.exchangeFailed && sess.CapturedCode == ""
+}
+
+func sessionHasCaptured(sess *loginSession) bool {
+	sessMu.Lock()
+	defer sessMu.Unlock()
+	return sess.CapturedCode != ""
 }
 
 // ingestPollCallback stores callback material carried on this poll.
@@ -744,6 +970,7 @@ func captureCallback(code, secret, state, ticketID string) *loginSession {
 		_, claimed := sess.claimedCodes[code]
 		if !claimed && (sess.CapturedCode == "" || sess.CapturedCode == code) {
 			sess.CapturedCode = code
+			sess.exchangeFailed = false
 		}
 	}
 	if secret != "" && (sess.CapturedSecret == "" || sess.CapturedSecret == secret) {
@@ -775,6 +1002,13 @@ func matchCallbackSessionLocked(state, ticketID string) *loginSession {
 		}
 		if matches == 1 {
 			return found
+		}
+	}
+	// A state that belonged to a replaced or expired session must not be
+	// written onto the session that replaced it.
+	if state != "" {
+		if until, ok := retiredSessions[state]; ok && time.Now().Before(until) {
+			return nil
 		}
 	}
 	if len(sessions) != 1 {

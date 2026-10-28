@@ -135,7 +135,7 @@ func oauthCallbackPage(bound *loginSession, code, secret, redirect string) strin
 	if code != "" && bound != nil {
 		paste := managementCallbackURL(bound.Port, code, bound.ID)
 		b.WriteString(`<h3>已接收授权码。</h3>`)
-		b.WriteString(`<p>把下面这一条粘贴到 CPA 管理界面的 OAuth 登录。不要粘贴浏览器地址栏里的原文。</p>`)
+		b.WriteString(`<p>回到「码道登录」页面即可，状态查询会完成登录。下面这一条只在需要手工提交时使用。不要粘贴浏览器地址栏里的原文。</p>`)
 		b.WriteString(`<p><code>` + html.EscapeString(paste) + `</code></p>`)
 		b.WriteString(`</body></html>`)
 		return b.String()
