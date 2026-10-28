@@ -42,6 +42,7 @@ func resetForTest(t *testing.T) {
 		sessMu.Lock()
 		sessions = map[string]*loginSession{}
 		sessMu.Unlock()
+		clearResourceBase()
 		SetEndpoints(endpointOverride{})
 		SetCaller(nil)
 		SetHTTPClient(nil)
@@ -51,6 +52,7 @@ func resetForTest(t *testing.T) {
 	sessMu.Lock()
 	sessions = map[string]*loginSession{}
 	sessMu.Unlock()
+	clearResourceBase()
 	SetEndpoints(endpointOverride{})
 	SetCaller(nil)
 	SetHTTPClient(nil)
@@ -117,8 +119,8 @@ func TestPluginRegisterDeclaresRequiredCapabilitiesAndConfigFields(t *testing.T)
 	if !caps.ModelRegistrar || !caps.ModelProvider || !caps.AuthProvider || !caps.Executor {
 		t.Fatalf("capabilities = %+v", caps)
 	}
-	if caps.ManagementAPI {
-		t.Fatal("management_api should be off; login is CPA OAuth, not a plugin page")
+	if !caps.ManagementAPI {
+		t.Fatal("management_api should be on so a remote panel can submit the loopback callback")
 	}
 	if caps.ExecutorModelScope != pluginapi.ExecutorModelScopeBoth {
 		t.Fatalf("executor_model_scope = %q", caps.ExecutorModelScope)
@@ -992,21 +994,29 @@ func pasteURLFromCallbackPage(t *testing.T, body string) string {
 	return html.UnescapeString(rest[:j])
 }
 
-func TestManagementRegisterHasNoPluginPage(t *testing.T) {
+func TestManagementRegisterExposesCallbackPageAndAuthenticatedPost(t *testing.T) {
 	resetForTest(t)
-	reg := resultMap(t, pluginabi.MethodManagementRegister, nil)
-	if v, ok := reg["Resources"]; ok && v != nil {
-		if arr, _ := v.([]any); len(arr) > 0 {
-			t.Fatalf("plugin webui resources still registered: %v", v)
-		}
+	raw := mustResult(t, pluginabi.MethodManagementRegister, nil)
+	var reg managementRegistrationJSON
+	if err := json.Unmarshal(raw, &reg); err != nil {
+		t.Fatal(err)
 	}
-	if v, ok := reg["resources"]; ok && v != nil {
-		if arr, _ := v.([]any); len(arr) > 0 {
-			t.Fatalf("plugin webui resources still registered: %v", v)
-		}
+	if len(reg.Resources) != 1 {
+		t.Fatalf("resources = %+v", reg.Resources)
 	}
-	env := mustHandle(t, pluginabi.MethodManagementHandle, []byte(`{"Method":"GET","Path":"/oauth"}`))
-	if env.OK {
-		t.Fatal("management.handle should be gone")
+	page := reg.Resources[0]
+	if page.Menu != managementMenuName || page.Path != resourceCallbackRoute || page.Description == "" {
+		t.Fatalf("resource = %+v", page)
+	}
+	if len(reg.Routes) != 1 {
+		t.Fatalf("routes = %+v", reg.Routes)
+	}
+	post := reg.Routes[0]
+	if post.Method != http.MethodPost || post.Path != managementCallbackRoute || post.Menu != "" {
+		t.Fatalf("post route = %+v", post)
+	}
+	status, result, _ := callManagement(t, pluginapi.ManagementRequest{Method: http.MethodGet, Path: "/oauth"})
+	if status != http.StatusNotFound || result.Message == "" {
+		t.Fatalf("unrelated path status=%d result=%+v", status, result)
 	}
 }

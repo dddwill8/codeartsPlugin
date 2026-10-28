@@ -80,7 +80,9 @@ func Handle(method string, request []byte) ([]byte, error) {
 	case pluginabi.MethodExecutorHTTPRequest:
 		return handleExecutorHTTP(request)
 	case pluginabi.MethodManagementRegister:
-		return okEnvelope(pluginapi.ManagementRegistrationResponse{})
+		return handleManagementRegister(request)
+	case pluginabi.MethodManagementHandle:
+		return handleManagement(request)
 	default:
 		return errorEnvelope("unknown_method", "unknown method: "+method, 0), nil
 	}
@@ -115,7 +117,7 @@ func pluginRegistration() registration {
 			ExecutorModelScope:    pluginapi.ExecutorModelScopeBoth,
 			ExecutorInputFormats:  []string{"chat-completions"},
 			ExecutorOutputFormats: []string{"chat-completions"},
-			ManagementAPI:         false,
+			ManagementAPI:         true,
 		},
 	}
 }
