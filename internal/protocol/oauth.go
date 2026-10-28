@@ -159,15 +159,18 @@ func DoJSON(client *http.Client, req *http.Request, maxBody int64) (status int, 
 }
 
 // CallbackParts is the Huawei loopback callback: first hop is secret+redirect,
-// second hop carries the authorization code.
+// second hop carries the authorization code. State and TicketID are optional
+// binding keys; the authorize URL does not send state.
 type CallbackParts struct {
 	Code     string
 	Secret   string
 	Redirect string
+	State    string
+	TicketID string
 }
 
-// ParseCallback extracts code / secret / redirect from a pasted callback URL,
-// a labeled Chinese prompt, or a raw authorization code.
+// ParseCallback extracts code / secret / redirect / state / ticket_id from a
+// pasted callback URL, a labeled Chinese prompt, or a raw authorization code.
 func ParseCallback(raw string) CallbackParts {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -184,6 +187,12 @@ func ParseCallback(raw string) CallbackParts {
 		if parts.Redirect == "" {
 			parts.Redirect = queryValue(raw, "redirect")
 		}
+		if parts.State == "" {
+			parts.State = queryValue(raw, "state")
+		}
+		if parts.TicketID == "" {
+			parts.TicketID = queryValue(raw, "ticket_id")
+		}
 		if parts.Secret == "" && parts.Redirect != "" {
 			if ru, err := url.Parse(parts.Redirect); err == nil {
 				parts.Secret = ru.Query().Get("secret")
@@ -191,11 +200,13 @@ func ParseCallback(raw string) CallbackParts {
 		}
 		return parts
 	}
-	if strings.Contains(raw, "code=") || strings.Contains(raw, "secret=") || strings.Contains(raw, "redirect=") {
+	if strings.Contains(raw, "code=") || strings.Contains(raw, "secret=") || strings.Contains(raw, "redirect=") || strings.Contains(raw, "state=") || strings.Contains(raw, "ticket_id=") {
 		parts := CallbackParts{
 			Code:     queryValue(raw, "code"),
 			Secret:   queryValue(raw, "secret"),
 			Redirect: queryValue(raw, "redirect"),
+			State:    queryValue(raw, "state"),
+			TicketID: queryValue(raw, "ticket_id"),
 		}
 		if parts.Secret == "" && parts.Redirect != "" {
 			if ru, err := url.Parse(parts.Redirect); err == nil {
@@ -268,6 +279,8 @@ func partsFromURL(rawURL string) CallbackParts {
 			Code:     queryValue(rawURL, "code"),
 			Secret:   queryValue(rawURL, "secret"),
 			Redirect: queryValue(rawURL, "redirect"),
+			State:    queryValue(rawURL, "state"),
+			TicketID: queryValue(rawURL, "ticket_id"),
 		}
 	}
 	q := u.Query()
@@ -275,6 +288,8 @@ func partsFromURL(rawURL string) CallbackParts {
 		Code:     q.Get("code"),
 		Secret:   q.Get("secret"),
 		Redirect: q.Get("redirect"),
+		State:    q.Get("state"),
+		TicketID: q.Get("ticket_id"),
 	}
 }
 

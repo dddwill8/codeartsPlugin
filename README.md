@@ -11,7 +11,7 @@
 ## 功能
 
 - OAuth PKCE 登录：`https://codearts.huaweicloud.com/portal/authorize`（`client_id=codearts-agent`、`code_challenge`、`ticket_id`）
-- 登录只在 `grant_type=authorization_code` + 会话 DPoP 换到 `refresh_token` 后完成；ticket 轮询只作进度，不会用无 DPoP 的 STS 落盘。本地 `/oauth/callback` 或 CPA OAuth 弹窗粘贴完整回调 URL 提供授权码
+- 登录只在 `grant_type=authorization_code` + 会话 DPoP 换到 `refresh_token` 后完成；ticket 轮询只作进度，不会用无 DPoP 的 STS 落盘。回调页在绑上 `code` 后给出带本会话 `state` 和 `code` 的 URL，把这一条贴进 CPA。第一跳不要贴，地址栏原文不再作为步骤
 - STS `grant_type=refresh_token` + DPoP ES256；持久化 `client_id`、DPoP 私钥 `d`、一次性 `refresh_token`、STS AK/SK/token
 - `POST /api/v2/chat/completions`，华为 `SDK-HMAC-SHA256`（CanonicalURI 以 `/` 结尾）。免费档模型带已签名的 `maas_type=benefit`、`model-id`、`model-name`
 - 有凭证时从 agent-center / builtin / benefit 发现模型；无凭证或发现失败时不注册离线种子
@@ -52,7 +52,7 @@ curl -H 'Authorization: Bearer codearts-test-key' http://127.0.0.1:8317/v1/model
 ## OAuth
 
 1. 打开 `http://127.0.0.1:8317/management.html`（管理密钥 `codearts-mgmt-key`），在「OAuth 登录」选择 provider `codearts`。
-2. 华为第一跳回调只有 `secret` 和 `redirect`（没有 code）。第二跳带 `code=`。Docker 里浏览器常常打不开 `127.0.0.1`，把地址栏完整 URL 贴回 CPA 的回调框。
+2. 华为第一跳只有 `secret` 和门户 `redirect`（没有 code）。回调页说明 secret 已记在本地、登录未完成，继续华为授权；不要把第一跳贴进管理界面。第二跳回调页给出 `http://127.0.0.1:<端口>/oauth/callback?code=<code>&state=<本会话 state>`，把这一条贴进 CPA。`state` 是插件注册进 CPA 的会话 ID。不要贴地址栏原文。
 3. 失败、过期或贴错时在 CPA OAuth 页取消会话后重新点 `codearts`。
 4. 成功后 host auth store 写入 `codearts-<user_id>.json`（STS + refresh_token + client_id + DPoP JWK）。
 

@@ -58,9 +58,24 @@ func TestParseCallbackFirstHopSecretRedirect(t *testing.T) {
 	if SafePortalRedirect(parts.Redirect) != wantRedirect {
 		t.Fatalf("unsafe redirect: %q", SafePortalRedirect(parts.Redirect))
 	}
+	if parts.State != "" || parts.TicketID != "" {
+		t.Fatalf("first hop invented binding keys: %+v", parts)
+	}
 
 	labeled := ParseCallback("回调地址为：" + pasted)
 	if labeled.Secret != wantSecret || labeled.Redirect != wantRedirect || labeled.Code != "" {
 		t.Fatalf("labeled paste = %+v", labeled)
+	}
+}
+
+func TestCallbackParseStateAndTicketID(t *testing.T) {
+	const raw = "http://127.0.0.1:18080/oauth/callback?code=abc&state=sess-1&ticket_id=ticket-9"
+	parts := ParseCallback(raw)
+	if parts.Code != "abc" || parts.State != "sess-1" || parts.TicketID != "ticket-9" {
+		t.Fatalf("url parts = %+v", parts)
+	}
+	loose := ParseCallback("code=abc&state=sess-1&ticket_id=ticket-9")
+	if loose.Code != "abc" || loose.State != "sess-1" || loose.TicketID != "ticket-9" {
+		t.Fatalf("loose parts = %+v", loose)
 	}
 }

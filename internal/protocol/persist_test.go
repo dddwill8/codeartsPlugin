@@ -2,8 +2,35 @@ package protocol
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
+
+func TestFileNameForEmptyUserIDUsesAccessKey(t *testing.T) {
+	a := FileNameFor(Credential{UserID: "", AccessKeyID: "AKID-a"})
+	b := FileNameFor(Credential{UserID: "  ", AccessKeyID: "AKID-b"})
+	if a != "codearts-AKID-a.json" || b != "codearts-AKID-b.json" {
+		t.Fatalf("access key names = %q %q", a, b)
+	}
+	if a == "codearts-unknown.json" || b == "codearts-unknown.json" {
+		t.Fatal("distinct accounts collapsed to codearts-unknown.json")
+	}
+	if strings.Contains(a, "ak:") || strings.Contains(b, "ak:") {
+		t.Fatalf("access key must not be prefixed: %q %q", a, b)
+	}
+	if got := FileNameFor(Credential{UserID: "u1", AccessKeyID: "AKID-a"}); got != "codearts-u1.json" {
+		t.Fatalf("user id should win: %q", got)
+	}
+	if got := FileNameFor(Credential{UserID: " usr/id "}); got != "codearts-usr_id.json" {
+		t.Fatalf("trimmed user id with slash = %q", got)
+	}
+	if got := FileNameFor(Credential{AccessKeyID: " AK/ID "}); got != "codearts-AK_ID.json" {
+		t.Fatalf("trimmed access key with slash = %q", got)
+	}
+	if got := FileNameFor(Credential{}); got != "codearts-unknown.json" {
+		t.Fatalf("both empty = %q", got)
+	}
+}
 
 func TestAccountKeyFallsBackToAccessKeyWhenUserIDEmpty(t *testing.T) {
 	if got := AccountKey(Credential{UserID: "u1", AccessKeyID: "AK"}); got != "u1" {
@@ -113,5 +140,40 @@ func TestApplyRefreshKeepsClientIDAndDPoPRotatesSTS(t *testing.T) {
 	}
 	if obj["refresh_token"] != "rt-new" {
 		t.Fatalf("json refresh_token = %v", obj["refresh_token"])
+	}
+}
+
+func TestLooksLikeCodeArts(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  []byte
+		file string
+		want bool
+	}{
+		{name: "nil body", raw: nil, want: false},
+		{name: "empty body", raw: []byte{}, want: false},
+		{name: "invalid json", raw: []byte(`{`), want: false},
+		{name: "json null", raw: []byte(`null`), want: false},
+		{name: "no keys", raw: []byte(`{}`), want: false},
+		{name: "empty type", raw: []byte(`{"type":""}`), want: false},
+		{name: "null type", raw: []byte(`{"type":null}`), want: false},
+		{name: "missing type with keys", raw: []byte(`{"access_key_id":"AK","secret_access_key":"SK"}`), want: false},
+		{name: "explicit codearts no keys", raw: []byte(`{"type":"codearts"}`), want: true},
+		{name: "explicit CodeArts", raw: []byte(`{"type":"CodeArts"}`), want: true},
+		{name: "explicit CODEARTS", raw: []byte(`{"type":"CODEARTS"}`), want: true},
+		{name: "other type", raw: []byte(`{"type":"other"}`), want: false},
+		{name: "filename other type", raw: []byte(`{"type":"other","access_key_id":"AK"}`), file: "codearts-ak.json", want: true},
+		{name: "filename empty type no secret", raw: []byte(`{"type":"","access_key_id":"AK"}`), file: "codearts-ak.json", want: true},
+		{name: "filename missing type", raw: []byte(`{"access_key_id":"AK"}`), file: "CODEARTS-User.JSON", want: true},
+		{name: "filename without ak", raw: []byte(`{"type":""}`), file: "codearts-ak.json", want: false},
+		{name: "filename empty ak", raw: []byte(`{"access_key_id":""}`), file: "codearts-ak.json", want: false},
+		{name: "other file no type", raw: []byte(`{"access_key_id":"AK"}`), file: "other.json", want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := LooksLikeCodeArts(tc.raw, tc.file); got != tc.want {
+				t.Fatalf("LooksLikeCodeArts(%s, %q) = %v, want %v", tc.raw, tc.file, got, tc.want)
+			}
+		})
 	}
 }
