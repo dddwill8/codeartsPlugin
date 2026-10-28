@@ -1,59 +1,33 @@
-# CodeArts CPA 插件
+# 华为码道 CPA 插件
 
-面向 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 的华为码道 / CodeArts 原生 C ABI 插件。协议参考 [HITZY2002/codearts2api](https://github.com/HITZY2002/codearts2api) 与 [Johnsheng1/codearts2api](https://github.com/Johnsheng1/codearts2api)。
+面向 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)（CPA）的华为码道插件。CPA 加载 `codearts.so` 之后，可以用码道账号做 OpenAI 兼容的对话。
 
-插件 ID（`.so` 文件名）为 `codearts`。能力：`model_registrar`、`model_provider`、`auth_provider`、`executor`。登录走 CPA 管理界面的 OAuth，不提供插件自己的 WebUI。
+## 原理
 
-## 约束
+插件负责登录、发现模型和转发对话。
 
-本机不安装 Go / CPA。构建、单测、CPA 启动一律在 Docker（OrbStack）中完成。
+登录在 CPA 管理界面里选 `codearts`。插件用 PKCE 向华为要授权码，再用这个码换成刷新令牌和 STS 临时密钥。换票时带本会话的 DPoP 密钥。登录完成后，CPA 的 auth 目录里会有一份 `codearts-<用户 ID>.json`。
 
-## 功能
+有这份证书之后，插件向码道查询当前账号能用的模型，并注册给 CPA。对话请求由插件用华为 `SDK-HMAC-SHA256` 签名，发到码道的对话接口。免费档模型会额外带 benefit 签名；账号没有对应免费档时，上游会拒绝这次调用。
 
-- OAuth PKCE 登录：`https://codearts.huaweicloud.com/portal/authorize`（`client_id=codearts-agent`、`code_challenge`、`ticket_id`）
-- 登录只在 `grant_type=authorization_code` + 会话 DPoP 换到 `refresh_token` 后完成；ticket 轮询只作进度，不会用无 DPoP 的 STS 落盘。回调页在绑上 `code` 后给出带本会话 `state` 和 `code` 的 URL，把这一条贴进 CPA。第一跳不要贴，地址栏原文不再作为步骤
-- STS `grant_type=refresh_token` + DPoP ES256；持久化 `client_id`、DPoP 私钥 `d`、一次性 `refresh_token`、STS AK/SK/token
-- `POST /api/v2/chat/completions`，华为 `SDK-HMAC-SHA256`（CanonicalURI 以 `/` 结尾）。免费档模型带已签名的 `maas_type=benefit`、`model-id`、`model-name`
-- 有凭证时从 agent-center / builtin / benefit 发现模型；无凭证或发现失败时不注册离线种子
-- CPA WebUI：`http://127.0.0.1:8317/management.html`，管理密钥 `codearts-mgmt-key`
+华为跳回本机时，回调页给出一条带本次登录 `state` 和 `code` 的 URL。把这一条贴回管理界面。`state` 是插件注册进 CPA 的会话 ID。
 
-## 构建与测试
+## 编译
 
-`.so` 是 CGO 产物，必须按目标机器的 `GOARCH` 现编，不能把 arm64 的文件拷到 x86。
+`.so` 按目标机器的架构编，并和 CPA 镜像使用同一套 glibc。用 Docker 里的 `golang:1.26-bookworm` 编译。
 
 ```bash
-# 容器内 go test
-make test
-
-# 当前机器架构：Apple Silicon → plugins/linux/arm64/codearts.so
-# x86_64 服务器 → plugins/linux/amd64/codearts.so
-make plugin
-
-# 交叉编 x86（在 ARM 机器上，走 QEMU）：
-# make plugin PLATFORM=linux/amd64
-
-# 启动 CPA（插件能力镜像，默认 eceasy/cli-proxy-api:v8.0.44，amd64/arm64 都有）
-make compose-up
-curl -H 'Authorization: Bearer codearts-test-key' http://127.0.0.1:8317/v1/models
-# WebUI: http://127.0.0.1:8317/management.html  管理密钥 codearts-mgmt-key
+make test                         # 容器里跑单测
+make plugin                       # 本机架构 → plugins/linux/<arch>/codearts.so
+make plugin PLATFORM=linux/amd64  # 在 ARM 机器上编 x86
 ```
 
-服务器上建议仍用这份 Makefile 在 Docker `golang:1.26-bookworm` 里编，这样 glibc 和 CPA 镜像一致。不要用比 CPA 容器更新的宿主 glibc 直接 `go build` 再挂进容器。
+文件放进 CPA 的 `plugins/linux/arm64/` 或 `plugins/linux/amd64/`。替换后要重启 CPA 进程，新的 `.so` 才会被加载。
 
-配置在 `deploy/cpa/config.yaml` 的 `plugins.configs.codearts`：
+编好的文件在 [v0.1.0](https://github.com/dddwill8/codeartsPlugin/releases/tag/v0.1.0)：`codearts-linux-arm64.so`、`codearts-linux-amd64.so`。
 
-| 字段 | 含义 |
-|---|---|
-| `oauth_callback_host` | 回调监听地址，容器内用 `0.0.0.0` |
-| `oauth_callback_port` | 回调端口，redirect_uri 固定为 `http://127.0.0.1:<port>/oauth/callback` |
-| `oauth_callback_path` | 回调路径 |
-| `benefit_auto_claim` | 发现模型时尝试领取免费档 |
+## 证书
 
-## OAuth
+`codearts-<用户 ID>.json` 里是 STS 临时密钥、刷新令牌、`client_id`，以及签 DPoP 用的私钥。CPA 在过期前调插件用刷新令牌续期。这个文件留在 CPA 的 auth 目录里，不要提交到仓库。
 
-1. 打开 `http://127.0.0.1:8317/management.html`（管理密钥 `codearts-mgmt-key`），在「OAuth 登录」选择 provider `codearts`。
-2. 华为第一跳只有 `secret` 和门户 `redirect`（没有 code）。回调页说明 secret 已记在本地、登录未完成，继续华为授权；不要把第一跳贴进管理界面。第二跳回调页给出 `http://127.0.0.1:<端口>/oauth/callback?code=<code>&state=<本会话 state>`，把这一条贴进 CPA。`state` 是插件注册进 CPA 的会话 ID。不要贴地址栏原文。
-3. 失败、过期或贴错时在 CPA OAuth 页取消会话后重新点 `codearts`。
-4. 成功后 host auth store 写入 `codearts-<user_id>.json`（STS + refresh_token + client_id + DPoP JWK）。
-
-码道 Web：https://devcloud.cn-north-4.huaweicloud.com/chat/home （与 snap-access / STS 共用协议；直播抓包需用户会话）。
+本地试用时，`make compose-up` 会拉起 CPA 并挂上刚编好的插件。接口在 `http://127.0.0.1:8317`（API 密钥 `codearts-test-key`），管理页在 `http://127.0.0.1:8317/management.html`（管理密钥 `codearts-mgmt-key`）。回调端口默认 `18080`。
