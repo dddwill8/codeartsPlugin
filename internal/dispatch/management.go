@@ -333,13 +333,7 @@ func loginStatus(state, callbackID string) bindOutcome {
 		}
 	}
 	if out.Rejected || out.PriorFailure {
-		return bindOutcome{
-			Status: http.StatusOK,
-			managementResult: managementResult{
-				Bound:   true,
-				Message: "授权码被拒绝，没有写入认证文件。请重新点登录后再授权。",
-			},
-		}
+		return rejectedLoginOutcome(state, false)
 	}
 	if out.Secret != "" {
 		return bindOutcome{
@@ -463,6 +457,47 @@ func exchangingOutcome() bindOutcome {
 	}
 }
 
+// rejectedLoginOutcome is the page's answer after an exchange rejected a code.
+// A newer code, or a redeem that is still inside exchangeCode, stays pending
+// so the page keeps polling. A success terminal written by a concurrent paste
+// stays visible. The terminal rejection is only for the failed code that is
+// still the latest one.
+func rejectedLoginOutcome(id string, stored bool) bindOutcome {
+	if stillRedeeming(id) {
+		return exchangingOutcome()
+	}
+	if done, ok := doneTerminalOutcome(id); ok {
+		return done
+	}
+	result := managementResult{
+		Bound:   true,
+		Message: "授权码被拒绝，没有写入认证文件。请重新点登录后再授权。",
+	}
+	if stored {
+		result.Stored = true
+	}
+	return bindOutcome{
+		Status:           http.StatusOK,
+		managementResult: result,
+	}
+}
+
+// stillRedeeming reports whether the live session has an unclaimed code or a
+// redeem still inside exchangeCode. The check is after redeemCaptured returns,
+// so this call's own count is already dropped.
+func stillRedeeming(id string) bool {
+	sess := getSession(id)
+	if sess == nil {
+		return false
+	}
+	sessMu.Lock()
+	defer sessMu.Unlock()
+	if sessions[id] != sess {
+		return false
+	}
+	return sess.CapturedCode != "" || sess.exchanging > 0
+}
+
 func bindPastedCallbackResult(parts protocol.CallbackParts, callbackID string) bindOutcome {
 	if parts.Code == "" && parts.Secret == "" {
 		return bindOutcome{
@@ -570,14 +605,7 @@ func exchangeBoundCode(sess *loginSession, callbackID string) bindOutcome {
 		}
 	}
 	if out.Rejected || out.PriorFailure {
-		return bindOutcome{
-			Status: http.StatusOK,
-			managementResult: managementResult{
-				Bound:   true,
-				Stored:  true,
-				Message: "授权码被拒绝，没有写入认证文件。请重新点登录后再授权。",
-			},
-		}
+		return rejectedLoginOutcome(sess.ID, true)
 	}
 	return bindOutcome{
 		Status: http.StatusOK,
@@ -824,7 +852,7 @@ code,#authlink{word-break:break-all}
 <p>点「登录」，在打开的页面完成华为授权。不需要打开 CPAMP 的 OAuth 卡片。</p>
 <p>华为会把浏览器带到本机的 <code>http://127.0.0.1:__PORT__/oauth/callback?...</code>。如果 Chrome 显示无法连接，地址栏里的完整 URL 就是回调。把它贴到下面。</p>
 <p>不要把这条 URL 贴进 CPA 的 OAuth 回调框。那条入口认不出华为带回的 state。</p>
-<p>本机浏览器能打开回调页时，不用粘贴。这一页会查询状态并完成登录。</p>
+<p>本机浏览器能打开回调页时，不用粘贴。这一页会查询状态并完成登录。刷新后会接着查同一次登录。登录还在进行时，再点「登录」不会另开一次。</p>
 <p><label for="key">管理密钥（与登录 CPAMP 相同）</label>
 <input id="key" name="key" type="password" autocomplete="current-password"></p>
 <p><button id="login" type="button">登录</button></p>
@@ -846,7 +874,9 @@ const result = document.getElementById('result');
 const button = document.getElementById('submit');
 const loginButton = document.getElementById('login');
 const storageKey = 'codearts.managementKey';
+const stateKey = 'codearts.loginState';
 let loginState = '';
+let loginPhase = 'idle';
 let pollTimer = 0;
 let pollGen = 0;
 let pollAbort = null;
@@ -894,6 +924,15 @@ function savedKey(){
   } catch (e) {}
   return readPanelKey();
 }
+function savedLoginState(){
+  try { return sessionStorage.getItem(stateKey) || ''; } catch (e) { return ''; }
+}
+function rememberLoginState(state){
+  try {
+    if (state) sessionStorage.setItem(stateKey, state);
+    else sessionStorage.removeItem(stateKey);
+  } catch (e) {}
+}
 function rememberKey(key, ok){
   try {
     if (!ok) sessionStorage.removeItem(storageKey);
@@ -937,16 +976,20 @@ function showStatus(data, status, text){
   result.textContent = resultMessage(status, text);
   if (data && data.label) result.textContent += '（' + data.label + '）';
   showContinue(data && data.continue_url);
+  if (status === 403) return;
+  if (data && data.pending === true) {
+    loginPhase = 'pending';
+    return;
+  }
+  if (data) loginPhase = 'terminal';
   if (data && data.done) stopPoll();
 }
-async function pollOnce(){
-  if (!loginState) return;
+async function fetchStatus(state){
   const gen = pollGen;
-  const state = loginState;
   const key = keyBox.value.replace(/[\r\n]/g, '').trim();
-  if (!key) return;
+  if (!state || !key) return null;
   const abort = new AbortController();
-  if (gen !== pollGen || state !== loginState) return;
+  if (gen !== pollGen || state !== loginState) return null;
   if (pollAbort) pollAbort.abort();
   pollAbort = abort;
   try {
@@ -960,24 +1003,78 @@ async function pollOnce(){
       credentials: 'same-origin',
       signal: abort.signal
     });
-    if (gen !== pollGen || state !== loginState) return;
+    if (gen !== pollGen || state !== loginState) return null;
     const text = await resp.text();
-    if (gen !== pollGen || state !== loginState) return;
+    if (gen !== pollGen || state !== loginState) return null;
     let data = null;
     try { data = JSON.parse(text); } catch (e) {}
-    if (data && (data.done || data.pending !== true)) {
-      if (gen !== pollGen || state !== loginState) return;
-      showStatus(data, resp.status, text);
-      return;
-    }
-    if (data && data.pending && !urlBox.value.trim() && gen === pollGen && state === loginState) result.textContent = resultMessage(resp.status, text);
-    if (gen !== pollGen || state !== loginState) return;
-    pollTimer = setTimeout(pollOnce, 2000);
+    return {data: data, status: resp.status, text: text, gen: gen, state: state};
   } catch (e) {
-    if (gen !== pollGen || state !== loginState) return;
-    if (e && e.name === 'AbortError') return;
-    pollTimer = setTimeout(pollOnce, 2000);
+    if (gen !== pollGen || state !== loginState) return null;
+    if (e && e.name === 'AbortError') return null;
+    return {error: true, gen: gen, state: state};
   }
+}
+function phaseOf(data){
+  if (!data || typeof data !== 'object') return 'stale';
+  if (data.pending === true) return 'pending';
+  return 'terminal';
+}
+async function refreshSaved(){
+  const state = loginState;
+  const gen = pollGen;
+  const snapshot = await fetchStatus(state);
+  if (!snapshot || snapshot.error || gen !== pollGen || state !== loginState) return 'stale';
+  if (snapshot.status === 403) {
+    rememberKey(keyBox.value.replace(/[\r\n]/g, '').trim(), false);
+    result.textContent = resultMessage(snapshot.status, snapshot.text);
+    return 'stale';
+  }
+  const phase = phaseOf(snapshot.data);
+  if (phase === 'stale') return 'stale';
+  loginPhase = phase;
+  if (phase === 'pending') {
+    if (!urlBox.value.trim()) result.textContent = resultMessage(snapshot.status, snapshot.text);
+    return 'pending';
+  }
+  showStatus(snapshot.data, snapshot.status, snapshot.text);
+  return 'terminal';
+}
+async function pollOnce(){
+  if (!loginState) return;
+  const gen = pollGen;
+  const state = loginState;
+  pollTimer = 0;
+  const snapshot = await fetchStatus(state);
+  if (!snapshot || gen !== pollGen || state !== loginState) return;
+  if (snapshot.status === 403) {
+    showStatus(snapshot.data, snapshot.status, snapshot.text);
+    rememberKey(keyBox.value.replace(/[\r\n]/g, '').trim(), false);
+    if (gen !== pollGen || state !== loginState) return;
+    pollTimer = setTimeout(pollOnce, 2000);
+    return;
+  }
+  if (snapshot.error || phaseOf(snapshot.data) === 'stale') {
+    if (gen !== pollGen || state !== loginState) return;
+    pollTimer = setTimeout(pollOnce, 2000);
+    return;
+  }
+  if (snapshot.data && snapshot.data.pending === true) {
+    loginPhase = 'pending';
+    if (!urlBox.value.trim() && gen === pollGen && state === loginState) result.textContent = resultMessage(snapshot.status, snapshot.text);
+    if (gen !== pollGen || state !== loginState) return;
+    pollTimer = setTimeout(pollOnce, 2000);
+    return;
+  }
+  if (gen !== pollGen || state !== loginState) return;
+  showStatus(snapshot.data, snapshot.status, snapshot.text);
+}
+function resumeLogin(){
+  const gen = pollGen;
+  refreshSaved().then(function (phase) {
+    if (gen !== pollGen || phase !== 'pending' || !loginState) return;
+    if (!pollTimer) pollTimer = setTimeout(pollOnce, 1000);
+  });
 }
 function resultMessage(status, text){
   try {
@@ -1013,6 +1110,7 @@ function showContinue(url){
   box.appendChild(link);
 }
 keyBox.value = savedKey();
+loginState = savedLoginState();
 loginButton.addEventListener('click', async function () {
   const key = keyBox.value.replace(/[\r\n]/g, '').trim();
   result.textContent = '';
@@ -1021,37 +1119,52 @@ loginButton.addEventListener('click', async function () {
     result.textContent = '先填写管理密钥。它和登录 CPAMP 时相同。';
     return;
   }
-  const popup = window.open('', '_blank');
   loginButton.disabled = true;
-  stopPoll();
-  pollGen++;
-  loginState = '';
   try {
-    const resp = await fetch(apiURL(cfg.start), {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Management-Key': key
-      },
-      body: '{}',
-      credentials: 'same-origin'
-    });
-    const text = await resp.text();
-    let data = null;
-    try { data = JSON.parse(text); } catch (e) {}
-    const auth = data && safeAuthURL(data.auth_url);
-    loginState = data && typeof data.state === 'string' ? data.state : '';
-    showAuthLink(auth || '');
-    if (popup) {
-      if (auth) popup.location = auth;
-      else popup.close();
+    if (loginState && loginPhase !== 'terminal') {
+      const phase = await refreshSaved();
+      if (phase === 'pending') {
+        result.textContent = '登录仍在进行。留着这一页即可。';
+        if (!pollTimer) pollTimer = setTimeout(pollOnce, 1000);
+        return;
+      }
+      if (phase !== 'terminal') return;
     }
-    result.textContent = resultMessage(resp.status, text);
-    rememberKey(key, resp.status !== 403);
-    if (loginState && data && data.pending) pollTimer = setTimeout(pollOnce, 1000);
-  } catch (e) {
-    if (popup) popup.close();
-    result.textContent = '登录没有送到 CPA。确认这个页面是从 CPA 打开的。';
+    const popup = window.open('', '_blank');
+    stopPoll();
+    pollGen++;
+    try {
+      const resp = await fetch(apiURL(cfg.start), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Management-Key': key
+        },
+        body: '{}',
+        credentials: 'same-origin'
+      });
+      const text = await resp.text();
+      let data = null;
+      try { data = JSON.parse(text); } catch (e) {}
+      const auth = data && safeAuthURL(data.auth_url);
+      const next = data && typeof data.state === 'string' ? data.state : '';
+      showAuthLink(auth || '');
+      if (popup) {
+        if (auth) popup.location = auth;
+        else popup.close();
+      }
+      result.textContent = resultMessage(resp.status, text);
+      rememberKey(key, resp.status !== 403);
+      if (next && data && data.pending) {
+        loginState = next;
+        loginPhase = 'pending';
+        rememberLoginState(next);
+        pollTimer = setTimeout(pollOnce, 1000);
+      }
+    } catch (e) {
+      if (popup) popup.close();
+      result.textContent = '登录没有送到 CPA。确认这个页面是从 CPA 打开的。';
+    }
   } finally {
     loginButton.disabled = false;
   }
@@ -1093,6 +1206,7 @@ form.addEventListener('submit', async function (ev) {
     button.disabled = false;
   }
 });
+if (loginState) resumeLogin();
 </script>
 </body></html>`
 	page = strings.ReplaceAll(page, "__PORT__", callbackPortLabel())

@@ -953,6 +953,12 @@ func TestLoginStartReplacesPreviousSession(t *testing.T) {
 	if strings.Contains(body, "未绑定到进行中的登录") || strings.Contains(body, huaweiState) {
 		t.Fatalf("callback page:\n%s", body)
 	}
+	if !strings.Contains(body, "已经打开的「码道登录」") || !strings.Contains(body, "OAuth 卡片") || !strings.Contains(body, "不要再点「登录」") {
+		t.Fatalf("callback page does not separate page and card login:\n%s", body)
+	}
+	if strings.Contains(body, "回到「码道登录」页面即可") {
+		t.Fatalf("callback page still sends every login through the plugin button:\n%s", body)
+	}
 	want := managementCallbackURL(port, huaweiCode, second.State)
 	if !strings.Contains(body, html.EscapeString(want)) {
 		t.Fatalf("page missing %s\n%s", want, body)

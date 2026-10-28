@@ -33,7 +33,7 @@ func TestManagementPageDoesNotCaptureQuery(t *testing.T) {
 		t.Fatalf("status=%d", status)
 	}
 	htmlBody := string(body)
-	for _, want := range []string{managementMenuName, "登录", "地址栏里的完整 URL", "不要把这条 URL 贴进 CPA 的 OAuth 回调框", "不需要打开 CPAMP", "http://127.0.0.1:18080/oauth/callback", "window.open", "login_state"} {
+	for _, want := range []string{managementMenuName, "登录", "地址栏里的完整 URL", "不要把这条 URL 贴进 CPA 的 OAuth 回调框", "不需要打开 CPAMP", "http://127.0.0.1:18080/oauth/callback", "刷新后会接着查同一次登录", "window.open", "login_state"} {
 		if !strings.Contains(htmlBody, want) {
 			t.Fatalf("page missing %s", want)
 		}
@@ -63,10 +63,29 @@ func TestManagementPageDoesNotCaptureQuery(t *testing.T) {
 		"new AbortController()",
 		"signal: abort.signal",
 		"pollGen++",
+		"codearts.loginState",
+		"function savedLoginState()",
+		"function rememberLoginState(",
+		"function resumeLogin()",
+		"if (loginState) resumeLogin();",
+		"loginPhase !== 'terminal'",
+		"登录仍在进行",
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("page script missing %s", want)
 		}
+	}
+	resumeAt := strings.Index(script, "function resumeLogin()")
+	clickAt := strings.Index(script, "loginButton.addEventListener")
+	if resumeAt < 0 || clickAt < resumeAt {
+		t.Fatal("resumeLogin is not defined before the login button")
+	}
+	resumeBody := script[resumeAt:clickAt]
+	if strings.Contains(resumeBody, "cfg.start") {
+		t.Fatal("resumeLogin starts a new session")
+	}
+	if !strings.Contains(resumeBody, "refreshSaved") {
+		t.Fatal("resumeLogin does not query the saved session")
 	}
 	if strings.Contains(script, "innerHTML") {
 		t.Fatal("page script assigns innerHTML")

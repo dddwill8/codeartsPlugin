@@ -32,13 +32,17 @@ type loginSession struct {
 	// claimedCodes are authorization codes this session already handed to
 	// exchangeCode. The same value must not be stored in CapturedCode again.
 	claimedCodes map[string]struct{}
-	// exchanging is true while this session is inside exchangeCode.
-	// exchangeFailed is set when that call rejected the code and no newer
-	// code was stored. claimCaptured clears it under the same lock that
-	// takes a newer code.
+	// exchanging counts redeemCaptured calls that have claimed a code and have
+	// not left exchangeCode. claimCaptured increments it under the same lock
+	// that takes the code. endExchange decrements it, and the count reaches
+	// zero only after every overlapping redeem has finished.
+	// exchangeFailed is set when an exchange rejected the code, no newer code
+	// is stored, and no other redeem is still inside exchangeCode.
+	// claimCaptured clears both failure flags under the same lock that takes
+	// a newer code.
 	// saveFailed is set when the code was redeemed but host.auth.save did
 	// not write the file. The claimed code stays claimed.
-	exchanging     bool
+	exchanging     int
 	exchangeFailed bool
 	saveFailed     bool
 }
@@ -330,8 +334,9 @@ func redeemCaptured(sess *loginSession, callbackID string) redeemOutcome {
 		out.PriorFailure = sessionExchangeFailed(sess)
 		return out
 	}
-	markExchanging(sess, true)
-	defer markExchanging(sess, false)
+	// claimCaptured already counted this redeem. endExchange runs on every
+	// return, including a rejected code, and only drops this call's count.
+	defer endExchange(sess)
 	tok, err := exchangeCode(callbackID, loginConfig(), sess, code)
 	if err != nil {
 		// The code was claimed before exchange. Do not clear CapturedCode
@@ -634,8 +639,10 @@ func getSession(id string) *loginSession {
 // claimCaptured copies CapturedCode and CapturedSecret. A non-empty code is
 // recorded in claimedCodes and cleared before sessMu is released so this poll
 // owns it. exchangeFailed and saveFailed from the previous code are cleared
-// under that same lock. CapturedSecret is left in place. Do not hold sessMu
-// across hostHTTPDo.
+// under that same lock, and exchanging is incremented there. A newer code
+// another redeem has already claimed is therefore busy before this function
+// returns, even though CapturedCode is empty again. CapturedSecret is left
+// in place. Do not hold sessMu across hostHTTPDo.
 func claimCaptured(sess *loginSession) (code, secret string) {
 	sessMu.Lock()
 	code, secret = sess.CapturedCode, sess.CapturedSecret
@@ -647,6 +654,7 @@ func claimCaptured(sess *loginSession) (code, secret string) {
 		sess.CapturedCode = ""
 		sess.exchangeFailed = false
 		sess.saveFailed = false
+		sess.exchanging++
 	}
 	sessMu.Unlock()
 	return code, secret
@@ -751,18 +759,27 @@ func clearLoginState() {
 	sessMu.Unlock()
 }
 
-func markExchanging(sess *loginSession, on bool) {
+// endExchange drops the count claimCaptured added for this redeem. It does not
+// clear a count another redeem still holds.
+func endExchange(sess *loginSession) {
+	if sess == nil {
+		return
+	}
 	sessMu.Lock()
-	sess.exchanging = on
+	if sess.exchanging > 0 {
+		sess.exchanging--
+	}
 	sessMu.Unlock()
 }
 
 // markExchangeFailedIfNoNewerCode sets exchangeFailed only when no newer
-// authorization code is already stored. The check and the write share sessMu,
-// so a callback that stored a code cannot lose that clear.
+// authorization code is stored and this session is not still inside another
+// redeem. An empty CapturedCode is not enough: the other redeem may already
+// have claimed that code. This call still holds one count, so a count above
+// one means that other redeem. The check and the write share sessMu.
 func markExchangeFailedIfNoNewerCode(sess *loginSession) {
 	sessMu.Lock()
-	if sess.CapturedCode == "" {
+	if sess.CapturedCode == "" && sess.exchanging <= 1 {
 		sess.exchangeFailed = true
 	}
 	sessMu.Unlock()
@@ -788,13 +805,13 @@ func sessionSaveBlocked(sess *loginSession) bool {
 	}
 	sessMu.Lock()
 	defer sessMu.Unlock()
-	return sess.saveFailed && sess.CapturedCode == "" && !sess.exchanging
+	return sess.saveFailed && sess.CapturedCode == "" && sess.exchanging == 0
 }
 
 func sessionBusy(sess *loginSession) bool {
 	sessMu.Lock()
 	defer sessMu.Unlock()
-	return sess.exchanging
+	return sess.exchanging > 0
 }
 
 func sessionExchangeFailed(sess *loginSession) bool {

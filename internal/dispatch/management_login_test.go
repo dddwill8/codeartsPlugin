@@ -3,6 +3,7 @@ package dispatch
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
@@ -189,7 +190,7 @@ func TestLoginStatusPrefersBusyOverPriorFailure(t *testing.T) {
 		t.Fatal("missing session")
 	}
 	sessMu.Lock()
-	sess.exchanging = true
+	sess.exchanging = 1
 	sess.exchangeFailed = true
 	sess.CapturedCode = ""
 	sessMu.Unlock()
@@ -225,6 +226,13 @@ func TestClaimClearsExchangeFailed(t *testing.T) {
 		t.Fatal("previous failure stayed set after claim")
 	}
 	sessMu.Lock()
+	busy := sess.exchanging
+	sessMu.Unlock()
+	if busy != 1 {
+		t.Fatalf("exchanging=%d, want 1", busy)
+	}
+	endExchange(sess)
+	sessMu.Lock()
 	left := sess.CapturedCode
 	sess.CapturedCode = "still-here"
 	sess.exchangeFailed = false
@@ -240,6 +248,326 @@ func TestClaimClearsExchangeFailed(t *testing.T) {
 	if failed || leftCode != "still-here" {
 		t.Fatalf("exchangeFailed=%v captured=%q", failed, leftCode)
 	}
+}
+
+func TestExchangeFailedRequiresNoOtherRedeem(t *testing.T) {
+	stub := &pollPasteStub{}
+	beginPollPaste(t, stub)
+	started := startPageLogin(t)
+	sess := getSession(started.State)
+	if sess == nil {
+		t.Fatal("missing session")
+	}
+	sessMu.Lock()
+	sess.CapturedCode = ""
+	sess.exchanging = 2
+	sess.exchangeFailed = false
+	sessMu.Unlock()
+
+	markExchangeFailedIfNoNewerCode(sess)
+	sessMu.Lock()
+	failed := sess.exchangeFailed
+	sessMu.Unlock()
+	if failed {
+		t.Fatal("exchangeFailed set while another redeem still holds a count")
+	}
+	endExchange(sess)
+	if !sessionBusy(sess) {
+		t.Fatal("one endExchange cleared the other redeem")
+	}
+	endExchange(sess)
+	if sessionBusy(sess) {
+		t.Fatal("count stayed above zero after both redeems finished")
+	}
+	endExchange(sess)
+	sessMu.Lock()
+	left := sess.exchanging
+	sessMu.Unlock()
+	if left != 0 {
+		t.Fatalf("exchanging=%d, want 0", left)
+	}
+	markExchangeFailedIfNoNewerCode(sess)
+	if !sessionExchangeFailed(sess) {
+		t.Fatal("exchangeFailed was not set once this session was idle")
+	}
+}
+
+func TestFailedExchangeKeepsUnclaimedNewerCode(t *testing.T) {
+	var state string
+	var hits int
+	beginPollPaste(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, protocol.EpOAuthTokens) {
+			http.NotFound(w, r)
+			return
+		}
+		hits++
+		body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		form, _ := url.ParseQuery(string(body))
+		switch form.Get("code") {
+		case "old-code":
+			captureCallback("newer-code", "", state, "")
+			http.Error(w, "reject", http.StatusBadRequest)
+		case "newer-code":
+			writePasteToken(w)
+		default:
+			http.Error(w, "unexpected code", http.StatusBadRequest)
+		}
+	}))
+	started := startPageLogin(t)
+	state = started.State
+	if captureCallback("old-code", "", state, "") == nil {
+		t.Fatal("capture failed")
+	}
+
+	out := loginStatus(state, "")
+	if out.Status != http.StatusOK || !out.Pending || out.Done || !strings.Contains(out.Message, "正在换票") {
+		t.Fatalf("status=%+v", out)
+	}
+	if strings.Contains(out.Message, "授权码被拒绝") || strings.Contains(out.Message, "请重新点登录") {
+		t.Fatalf("terminal rejection while a newer code is stored: %+v", out)
+	}
+	if hits != 1 {
+		t.Fatalf("hits=%d", hits)
+	}
+	got, _, ok := capturedOf(t, state)
+	if !ok || got != "newer-code" {
+		t.Fatalf("captured=%q ok=%v", got, ok)
+	}
+	if sessionExchangeFailed(getSession(state)) {
+		t.Fatal("exchangeFailed set while a newer code is stored")
+	}
+
+	next := loginStatus(state, "")
+	if next.Status != http.StatusOK || !next.Done || hits != 2 {
+		t.Fatalf("next=%+v hits=%d", next, hits)
+	}
+}
+
+func TestPasteRejectionStaysPendingWhenNewerCodeArrived(t *testing.T) {
+	var state string
+	var hits int
+	beginPollPaste(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, protocol.EpOAuthTokens) {
+			http.NotFound(w, r)
+			return
+		}
+		hits++
+		body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		form, _ := url.ParseQuery(string(body))
+		switch form.Get("code") {
+		case "old-code":
+			captureCallback("newer-code", "", state, "")
+			http.Error(w, "reject", http.StatusBadRequest)
+		case "newer-code":
+			writePasteToken(w)
+		default:
+			http.Error(w, "unexpected code", http.StatusBadRequest)
+		}
+	}))
+	started := startPageLogin(t)
+	state = started.State
+	if captureCallback("old-code", "", state, "") == nil {
+		t.Fatal("capture failed")
+	}
+	status, result, _ := submitCallback(t, "http://127.0.0.1:18080/oauth/callback?code=old-code&state=huawei-old")
+	if status != http.StatusOK || !result.Pending || result.Done || !strings.Contains(result.Message, "正在换票") {
+		t.Fatalf("status=%d result=%+v", status, result)
+	}
+	if strings.Contains(result.Message, "请重新点登录") || hits != 1 {
+		t.Fatalf("result=%+v hits=%d", result, hits)
+	}
+	next := loginStatus(state, "")
+	if next.Status != http.StatusOK || !next.Done || hits != 2 {
+		t.Fatalf("next=%+v hits=%d", next, hits)
+	}
+}
+
+func TestOverlappingRedeemKeepsTheOtherBusy(t *testing.T) {
+	gate := newExchangeGate("old-code", "new-code")
+	t.Cleanup(gate.releaseAll)
+	beginPollPaste(t, gate)
+
+	started := startPageLogin(t)
+	state := started.State
+	if captureCallback("old-code", "", state, "") == nil {
+		t.Fatal("capture failed")
+	}
+	firstDone := make(chan bindOutcome, 1)
+	go func() { firstDone <- loginStatus(state, "") }()
+	waitGate(t, gate.started["old-code"])
+
+	if captureCallback("new-code", "", state, "") == nil {
+		t.Fatal("newer capture failed")
+	}
+	secondDone := make(chan bindOutcome, 1)
+	go func() { secondDone <- loginStatus(state, "") }()
+	waitGate(t, gate.started["new-code"])
+
+	count, failed, captured, alive := sessionExchangeSnapshot(state)
+	if !alive || count != 2 || failed || captured != "" {
+		t.Fatalf("count=%d failed=%v captured=%q alive=%v", count, failed, captured, alive)
+	}
+
+	gate.release("old-code")
+	first := waitOutcome(t, firstDone)
+	if first.Status != http.StatusOK || !first.Pending || first.Done || !strings.Contains(first.Message, "正在换票") {
+		t.Fatalf("first=%+v", first)
+	}
+	if strings.Contains(first.Message, "授权码被拒绝") || strings.Contains(first.Message, "请重新点登录") {
+		t.Fatalf("failed redeem hid the newer exchange: %+v", first)
+	}
+	count, failed, _, alive = sessionExchangeSnapshot(state)
+	if !alive || count != 1 || failed {
+		t.Fatalf("after first returned count=%d failed=%v alive=%v", count, failed, alive)
+	}
+
+	gate.release("new-code")
+	second := waitOutcome(t, secondDone)
+	if second.Status != http.StatusOK || !second.Done || gate.hitCount() != 2 {
+		t.Fatalf("second=%+v hits=%d", second, gate.hitCount())
+	}
+}
+
+func TestFailedStatusKeepsConcurrentSuccess(t *testing.T) {
+	gate := newExchangeGate("old-code", "new-code")
+	t.Cleanup(gate.releaseAll)
+	beginPollPaste(t, gate)
+
+	started := startPageLogin(t)
+	state := started.State
+	if captureCallback("old-code", "", state, "") == nil {
+		t.Fatal("capture failed")
+	}
+	firstDone := make(chan bindOutcome, 1)
+	go func() { firstDone <- loginStatus(state, "") }()
+	waitGate(t, gate.started["old-code"])
+	if captureCallback("new-code", "", state, "") == nil {
+		t.Fatal("newer capture failed")
+	}
+	secondDone := make(chan bindOutcome, 1)
+	go func() { secondDone <- loginStatus(state, "") }()
+	waitGate(t, gate.started["new-code"])
+
+	gate.release("new-code")
+	second := waitOutcome(t, secondDone)
+	if second.Status != http.StatusOK || !second.Done {
+		t.Fatalf("second=%+v", second)
+	}
+	term, ok := terminalOf(state)
+	if !ok || !term.OK {
+		t.Fatalf("terminal=%+v ok=%v", term, ok)
+	}
+
+	gate.release("old-code")
+	first := waitOutcome(t, firstDone)
+	if first.Status != http.StatusOK || !first.Done || first.Pending || !strings.Contains(first.Message, "登录完成") {
+		t.Fatalf("first=%+v", first)
+	}
+	if strings.Contains(first.Message, "授权码被拒绝") || gate.hitCount() != 2 {
+		t.Fatalf("first=%+v hits=%d", first, gate.hitCount())
+	}
+}
+
+func writePasteToken(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(`{"user_id":"u-paste","user_name":"paste","refresh_token":"rt-paste","credentials":{"access_key_id":"AKPASTE","secret_access_key":"skpaste","security_token":"st-paste","expiration":"2026-12-01T00:00:00Z"}}`))
+}
+
+type exchangeGate struct {
+	mu          sync.Mutex
+	hits        int
+	started     map[string]chan struct{}
+	hold        map[string]chan struct{}
+	startOnce   map[string]*sync.Once
+	releaseOnce map[string]*sync.Once
+}
+
+func newExchangeGate(codes ...string) *exchangeGate {
+	g := &exchangeGate{
+		started:     map[string]chan struct{}{},
+		hold:        map[string]chan struct{}{},
+		startOnce:   map[string]*sync.Once{},
+		releaseOnce: map[string]*sync.Once{},
+	}
+	for _, code := range codes {
+		g.started[code] = make(chan struct{})
+		g.hold[code] = make(chan struct{})
+		g.startOnce[code] = &sync.Once{}
+		g.releaseOnce[code] = &sync.Once{}
+	}
+	return g
+}
+
+func (g *exchangeGate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, protocol.EpOAuthTokens) {
+		http.NotFound(w, r)
+		return
+	}
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	form, _ := url.ParseQuery(string(body))
+	code := form.Get("code")
+	g.mu.Lock()
+	g.hits++
+	g.mu.Unlock()
+	if started := g.started[code]; started != nil {
+		g.startOnce[code].Do(func() { close(started) })
+	}
+	if hold := g.hold[code]; hold != nil {
+		<-hold
+	}
+	if code == "old-code" {
+		http.Error(w, "reject", http.StatusBadRequest)
+		return
+	}
+	writePasteToken(w)
+}
+
+func (g *exchangeGate) release(code string) {
+	if once := g.releaseOnce[code]; once != nil {
+		once.Do(func() { close(g.hold[code]) })
+	}
+}
+
+func (g *exchangeGate) releaseAll() {
+	for code := range g.hold {
+		g.release(code)
+	}
+}
+
+func (g *exchangeGate) hitCount() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.hits
+}
+
+func waitGate(t *testing.T, ch chan struct{}) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for token exchange")
+	}
+}
+
+func waitOutcome(t *testing.T, ch chan bindOutcome) bindOutcome {
+	t.Helper()
+	select {
+	case out := <-ch:
+		return out
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for login status")
+	}
+	return bindOutcome{}
+}
+
+func sessionExchangeSnapshot(id string) (count int, failed bool, captured string, alive bool) {
+	sessMu.Lock()
+	defer sessMu.Unlock()
+	sess := sessions[id]
+	if sess == nil {
+		return 0, false, "", false
+	}
+	return sess.exchanging, sess.exchangeFailed, sess.CapturedCode, true
 }
 
 func TestPageLoginReplacesTheOnlySession(t *testing.T) {
