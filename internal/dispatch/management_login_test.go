@@ -56,9 +56,34 @@ func TestPageLoginPasteExchangesWithoutCPAMPCard(t *testing.T) {
 		t.Fatalf("terminal=%+v ok=%v", term, ok)
 	}
 
-	againStatus, again, _ := submitCallback(t, rawURL)
-	if againStatus != http.StatusConflict || again.Stored || stub.tokenHits != 1 {
+	againBody := mustJSON(t, map[string]string{
+		"url":         rawURL,
+		"login_state": started.State,
+	})
+	againStatus, again, _ := callManagement(t, pluginapi.ManagementRequest{
+		Method:  http.MethodPost,
+		Path:    managementCallbackFull,
+		Headers: managementHeaders("test-mgmt"),
+		Body:    againBody,
+	})
+	if againStatus != http.StatusOK || !again.Done || again.Stored || again.Label != "paste" || stub.tokenHits != 1 {
 		t.Fatalf("repeat status=%d result=%+v hits=%d", againStatus, again, stub.tokenHits)
+	}
+	if !strings.Contains(again.Message, "登录完成") {
+		t.Fatalf("repeat message=%q", again.Message)
+	}
+	manual := "http://127.0.0.1:18080/oauth/callback?code=" + code + "&state=" + url.QueryEscape(started.State)
+	manualStatus, manualResult, _ := submitCallback(t, manual)
+	if manualStatus != http.StatusOK || !manualResult.Done || manualResult.Stored || manualResult.Label != "paste" || stub.tokenHits != 1 {
+		t.Fatalf("manual status=%d result=%+v hits=%d", manualStatus, manualResult, stub.tokenHits)
+	}
+	next := startPageLogin(t)
+	oldStatus, oldResult, _ := submitCallback(t, manual)
+	if oldStatus != http.StatusOK || !oldResult.Done || oldResult.Stored || stub.tokenHits != 1 {
+		t.Fatalf("old state status=%d result=%+v hits=%d", oldStatus, oldResult, stub.tokenHits)
+	}
+	if got, _, ok := capturedOf(t, next.State); !ok || got != "" {
+		t.Fatalf("new session captured %q ok=%v", got, ok)
 	}
 	poll := pollLogin(t, mustJSON(t, map[string]any{"State": started.State}))
 	if poll.Status != pluginapi.AuthLoginStatusError || stub.tokenHits != 1 {
@@ -106,6 +131,114 @@ func TestPageStatusExchangesCodeCapturedByListener(t *testing.T) {
 	poll := pollLogin(t, mustJSON(t, map[string]any{"State": started.State}))
 	if poll.Status == pluginapi.AuthLoginStatusSuccess || stub.tokenHits != 1 {
 		t.Fatalf("poll status=%q hits=%d", poll.Status, stub.tokenHits)
+	}
+}
+
+func TestPageLoginSaveFailureIsNotDone(t *testing.T) {
+	stub := &pollPasteStub{}
+	beginPollPaste(t, stub)
+	host := &loginHost{failSave: true}
+	SetCaller(host)
+	started := startPageLogin(t)
+	const code = "save-fail-code"
+	rawURL := "http://127.0.0.1:18080/oauth/callback?code=" + code + "&state=huawei-save"
+	status, result, body := submitCallback(t, rawURL)
+	if status != http.StatusBadGateway || result.Done || result.OK || !strings.Contains(result.Message, "没有写入") {
+		t.Fatalf("status=%d result=%+v body=%s", status, result, body)
+	}
+	if stub.tokenHits != 1 || stub.code != code {
+		t.Fatalf("hits=%d code=%q", stub.tokenHits, stub.code)
+	}
+	if host.saveCount() != 1 {
+		t.Fatalf("save calls=%d", host.saveCount())
+	}
+	if _, ok := terminalOf(started.State); ok {
+		t.Fatal("save failure wrote a success terminal")
+	}
+	got, _, ok := capturedOf(t, started.State)
+	if !ok || got != "" {
+		t.Fatalf("session code=%q ok=%v", got, ok)
+	}
+	if strings.Contains(string(body), code) || strings.Contains(string(body), "rt-paste") {
+		t.Fatalf("leaked callback: %s", body)
+	}
+
+	againStatus, again, _ := queryPageLogin(t, started.State)
+	if againStatus != http.StatusBadGateway || again.Done || !strings.Contains(again.Message, "没有写入") || stub.tokenHits != 1 || host.saveCount() != 1 {
+		t.Fatalf("status=%d result=%+v hits=%d saves=%d", againStatus, again, stub.tokenHits, host.saveCount())
+	}
+	pasteStatus, paste, _ := submitCallback(t, rawURL)
+	if pasteStatus != http.StatusBadGateway || paste.Done || paste.Stored || stub.tokenHits != 1 || host.saveCount() != 1 {
+		t.Fatalf("paste status=%d result=%+v hits=%d saves=%d", pasteStatus, paste, stub.tokenHits, host.saveCount())
+	}
+	poll := pollLogin(t, mustJSON(t, map[string]any{"State": started.State}))
+	if poll.Status != pluginapi.AuthLoginStatusError || stub.tokenHits != 1 || strings.Contains(poll.Message, "rt-paste") {
+		t.Fatalf("poll status=%q message=%q hits=%d", poll.Status, poll.Message, stub.tokenHits)
+	}
+	if !strings.Contains(poll.Message, "not written") {
+		t.Fatalf("poll message=%q", poll.Message)
+	}
+}
+
+func TestLoginStatusPrefersBusyOverPriorFailure(t *testing.T) {
+	stub := &pollPasteStub{}
+	beginPollPaste(t, stub)
+	started := startPageLogin(t)
+	sess := getSession(started.State)
+	if sess == nil {
+		t.Fatal("missing session")
+	}
+	sessMu.Lock()
+	sess.exchanging = true
+	sess.exchangeFailed = true
+	sess.CapturedCode = ""
+	sessMu.Unlock()
+
+	out := loginStatus(started.State, "")
+	if out.Status != http.StatusOK || !out.Pending || out.Done || !strings.Contains(out.Message, "正在换票") {
+		t.Fatalf("status=%+v", out)
+	}
+	if strings.Contains(out.Message, "授权码被拒绝") {
+		t.Fatalf("prior failure won: %+v", out)
+	}
+}
+
+func TestClaimClearsExchangeFailed(t *testing.T) {
+	stub := &pollPasteStub{}
+	beginPollPaste(t, stub)
+	started := startPageLogin(t)
+	sess := getSession(started.State)
+	if sess == nil {
+		t.Fatal("missing session")
+	}
+	sessMu.Lock()
+	sess.CapturedCode = "newer-code"
+	sess.exchangeFailed = true
+	sess.saveFailed = true
+	sessMu.Unlock()
+
+	code, _ := claimCaptured(sess)
+	if code != "newer-code" {
+		t.Fatalf("code=%q", code)
+	}
+	if sessionExchangeFailed(sess) || sessionSaveFailed(sess) {
+		t.Fatal("previous failure stayed set after claim")
+	}
+	sessMu.Lock()
+	left := sess.CapturedCode
+	sess.CapturedCode = "still-here"
+	sess.exchangeFailed = false
+	sessMu.Unlock()
+	if left != "" {
+		t.Fatalf("captured left %q", left)
+	}
+	markExchangeFailedIfNoNewerCode(sess)
+	sessMu.Lock()
+	failed := sess.exchangeFailed
+	leftCode := sess.CapturedCode
+	sessMu.Unlock()
+	if failed || leftCode != "still-here" {
+		t.Fatalf("exchangeFailed=%v captured=%q", failed, leftCode)
 	}
 }
 
@@ -411,8 +544,9 @@ type loginHostCall struct {
 }
 
 type loginHost struct {
-	mu    sync.Mutex
-	calls []loginHostCall
+	mu       sync.Mutex
+	calls    []loginHostCall
+	failSave bool
 }
 
 func (h *loginHost) Call(method string, payload []byte) ([]byte, error) {
@@ -438,13 +572,22 @@ func (h *loginHost) Call(method string, payload []byte) ([]byte, error) {
 			return nil, err
 		}
 		rec.name = req.Name
+		h.mu.Lock()
+		h.calls = append(h.calls, rec)
+		fail := h.failSave
+		h.mu.Unlock()
+		if fail {
+			return json.Marshal(envelope{OK: false, Error: &envelopeError{Code: "save_error", Message: "auth dir missing"}})
+		}
 		body = []byte(`{"name":"` + req.Name + `"}`)
 	default:
 		body = []byte(`{}`)
 	}
-	h.mu.Lock()
-	h.calls = append(h.calls, rec)
-	h.mu.Unlock()
+	if method != pluginabi.MethodHostAuthSave {
+		h.mu.Lock()
+		h.calls = append(h.calls, rec)
+		h.mu.Unlock()
+	}
 	result, err := json.Marshal(struct {
 		StatusCode int    `json:"StatusCode"`
 		Body       []byte `json:"Body"`
@@ -489,4 +632,14 @@ func (h *loginHost) saved(name string) bool {
 		}
 	}
 	return false
+}
+
+func (h *loginHost) saveCount() int {
+	n := 0
+	for _, call := range h.snapshot() {
+		if call.method == pluginabi.MethodHostAuthSave {
+			n++
+		}
+	}
+	return n
 }

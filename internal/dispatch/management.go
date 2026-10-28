@@ -294,16 +294,8 @@ func loginStatus(state, callbackID string) bindOutcome {
 	}
 	sess := getSession(state)
 	if sess == nil {
-		if term, ok := terminalOf(state); ok && term.OK {
-			return bindOutcome{
-				Status: http.StatusOK,
-				managementResult: managementResult{
-					OK:      true,
-					Done:    true,
-					Label:   term.Label,
-					Message: "登录完成。",
-				},
-			}
+		if done, ok := doneTerminalOutcome(state); ok {
+			return done
 		}
 		return bindOutcome{
 			Status: http.StatusOK,
@@ -313,6 +305,12 @@ func loginStatus(state, callbackID string) bindOutcome {
 		}
 	}
 	out := redeemCaptured(sess, callbackID)
+	if out.Busy {
+		return exchangingOutcome()
+	}
+	if out.SaveFailed {
+		return fileNotWrittenOutcome()
+	}
 	if out.Hard != nil {
 		return bindOutcome{
 			Status: http.StatusBadGateway,
@@ -340,17 +338,6 @@ func loginStatus(state, callbackID string) bindOutcome {
 			managementResult: managementResult{
 				Bound:   true,
 				Message: "授权码被拒绝，没有写入认证文件。请重新点登录后再授权。",
-			},
-		}
-	}
-	if out.Busy {
-		return bindOutcome{
-			Status: http.StatusOK,
-			managementResult: managementResult{
-				OK:      true,
-				Bound:   true,
-				Pending: true,
-				Message: "正在换票。",
 			},
 		}
 	}
@@ -399,8 +386,18 @@ type bindOutcome struct {
 // bindPastedCallback stores the paste on one in-flight session. A stored
 // authorization code is exchanged here. A first hop only records the secret.
 // pageState, when set, binds only that session and does not open a new one.
+// An unexpired success for pageState or the callback state returns the same
+// done result as loginStatus and does not capture or exchange. A retired id
+// with no success terminal stays unbound, so a replaced login cannot accept
+// the old code.
 func bindPastedCallback(parts protocol.CallbackParts, callbackID, pageState string) bindOutcome {
 	pageState = strings.TrimSpace(pageState)
+	if done, ok := doneTerminalOutcome(pageState); ok {
+		return done
+	}
+	if done, ok := doneTerminalOutcome(parts.State); ok {
+		return done
+	}
 	if isRetiredSession(parts.State) {
 		return finishBind(parts, unboundLoginResult())
 	}
@@ -420,6 +417,48 @@ func unboundLoginResult() bindOutcome {
 		Status: http.StatusConflict,
 		managementResult: managementResult{
 			Message: "未绑定。没有进行中的登录。请重新点登录。没有写入任何会话。",
+		},
+	}
+}
+
+func doneTerminalOutcome(id string) (bindOutcome, bool) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return bindOutcome{}, false
+	}
+	term, ok := terminalOf(id)
+	if !ok || !term.OK {
+		return bindOutcome{}, false
+	}
+	return bindOutcome{
+		Status: http.StatusOK,
+		managementResult: managementResult{
+			OK:      true,
+			Done:    true,
+			Label:   term.Label,
+			Message: "登录完成。",
+		},
+	}, true
+}
+
+func fileNotWrittenOutcome() bindOutcome {
+	return bindOutcome{
+		Status: http.StatusBadGateway,
+		managementResult: managementResult{
+			Bound:   true,
+			Message: "认证文件没有写入。请重新点登录后再授权。",
+		},
+	}
+}
+
+func exchangingOutcome() bindOutcome {
+	return bindOutcome{
+		Status: http.StatusOK,
+		managementResult: managementResult{
+			OK:      true,
+			Bound:   true,
+			Pending: true,
+			Message: "正在换票。",
 		},
 	}
 }
@@ -451,6 +490,9 @@ func bindPastedCallbackResult(parts protocol.CallbackParts, callbackID string) b
 		sess.CapturedRedirect = safeRedirect
 	}
 	sessMu.Unlock()
+	if sessionSaveBlocked(sess) {
+		return fileNotWrittenOutcome()
+	}
 
 	if parts.Code != "" {
 		if capturedCode == parts.Code {
@@ -499,6 +541,12 @@ func bindPastedCallbackResult(parts protocol.CallbackParts, callbackID string) b
 
 func exchangeBoundCode(sess *loginSession, callbackID string) bindOutcome {
 	out := redeemCaptured(sess, callbackID)
+	if out.Busy {
+		return exchangingOutcome()
+	}
+	if out.SaveFailed {
+		return fileNotWrittenOutcome()
+	}
 	if out.Hard != nil {
 		return bindOutcome{
 			Status: http.StatusBadGateway,
@@ -521,7 +569,7 @@ func exchangeBoundCode(sess *loginSession, callbackID string) bindOutcome {
 			},
 		}
 	}
-	if out.Rejected {
+	if out.Rejected || out.PriorFailure {
 		return bindOutcome{
 			Status: http.StatusOK,
 			managementResult: managementResult{
@@ -800,6 +848,8 @@ const loginButton = document.getElementById('login');
 const storageKey = 'codearts.managementKey';
 let loginState = '';
 let pollTimer = 0;
+let pollGen = 0;
+let pollAbort = null;
 
 function textBytes(s){return new TextEncoder().encode(s)}
 function fromB64(b64){
@@ -860,6 +910,7 @@ function apiURL(path){
 function postURL(){return apiURL(cfg.post)}
 function stopPoll(){
   if (pollTimer) { clearTimeout(pollTimer); pollTimer = 0; }
+  if (pollAbort) { pollAbort.abort(); pollAbort = null; }
 }
 function safeAuthURL(url){
   if (typeof url !== 'string' || url === '') return '';
@@ -890,8 +941,14 @@ function showStatus(data, status, text){
 }
 async function pollOnce(){
   if (!loginState) return;
+  const gen = pollGen;
+  const state = loginState;
   const key = keyBox.value.replace(/[\r\n]/g, '').trim();
   if (!key) return;
+  const abort = new AbortController();
+  if (gen !== pollGen || state !== loginState) return;
+  if (pollAbort) pollAbort.abort();
+  pollAbort = abort;
   try {
     const resp = await fetch(apiURL(cfg.status), {
       method: 'POST',
@@ -899,19 +956,26 @@ async function pollOnce(){
         'Content-Type': 'application/json',
         'X-Management-Key': key
       },
-      body: JSON.stringify({state: loginState}),
-      credentials: 'same-origin'
+      body: JSON.stringify({state: state}),
+      credentials: 'same-origin',
+      signal: abort.signal
     });
+    if (gen !== pollGen || state !== loginState) return;
     const text = await resp.text();
+    if (gen !== pollGen || state !== loginState) return;
     let data = null;
     try { data = JSON.parse(text); } catch (e) {}
     if (data && (data.done || data.pending !== true)) {
+      if (gen !== pollGen || state !== loginState) return;
       showStatus(data, resp.status, text);
       return;
     }
-    if (data && data.pending && !urlBox.value.trim()) result.textContent = resultMessage(resp.status, text);
+    if (data && data.pending && !urlBox.value.trim() && gen === pollGen && state === loginState) result.textContent = resultMessage(resp.status, text);
+    if (gen !== pollGen || state !== loginState) return;
     pollTimer = setTimeout(pollOnce, 2000);
   } catch (e) {
+    if (gen !== pollGen || state !== loginState) return;
+    if (e && e.name === 'AbortError') return;
     pollTimer = setTimeout(pollOnce, 2000);
   }
 }
@@ -960,6 +1024,7 @@ loginButton.addEventListener('click', async function () {
   const popup = window.open('', '_blank');
   loginButton.disabled = true;
   stopPoll();
+  pollGen++;
   loginState = '';
   try {
     const resp = await fetch(apiURL(cfg.start), {

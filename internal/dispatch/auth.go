@@ -34,9 +34,13 @@ type loginSession struct {
 	claimedCodes map[string]struct{}
 	// exchanging is true while this session is inside exchangeCode.
 	// exchangeFailed is set when that call rejected the code and no newer
-	// code was stored.
+	// code was stored. claimCaptured clears it under the same lock that
+	// takes a newer code.
+	// saveFailed is set when the code was redeemed but host.auth.save did
+	// not write the file. The claimed code stays claimed.
 	exchanging     bool
 	exchangeFailed bool
+	saveFailed     bool
 }
 
 // loginTerminal is what remains after a session is deleted, until ExpiresAt.
@@ -189,6 +193,12 @@ func handleLoginPoll(request []byte) ([]byte, error) {
 	if out.Hard != nil {
 		return errorEnvelope(out.Hard.Code, out.Hard.Msg, out.Hard.Status), nil
 	}
+	if out.SaveFailed {
+		return okEnvelope(pluginapi.AuthLoginPollResponse{
+			Status:  pluginapi.AuthLoginStatusError,
+			Message: "credential file was not written",
+		})
+	}
 	if out.Exchanged {
 		return okEnvelope(pluginapi.AuthLoginPollResponse{
 			Status:  pluginapi.AuthLoginStatusSuccess,
@@ -306,6 +316,9 @@ type redeemOutcome struct {
 	// PriorFailure means an earlier exchange rejected the code and no newer
 	// code is waiting. This call did not exchange.
 	PriorFailure bool
+	// SaveFailed means the code was redeemed and host.auth.save failed.
+	// No success terminal was written.
+	SaveFailed bool
 }
 
 func redeemCaptured(sess *loginSession, callbackID string) redeemOutcome {
@@ -313,6 +326,7 @@ func redeemCaptured(sess *loginSession, callbackID string) redeemOutcome {
 	out := redeemOutcome{Secret: secret}
 	if code == "" {
 		out.Busy = sessionBusy(sess)
+		out.SaveFailed = sessionSaveFailed(sess)
 		out.PriorFailure = sessionExchangeFailed(sess)
 		return out
 	}
@@ -325,13 +339,15 @@ func redeemCaptured(sess *loginSession, callbackID string) redeemOutcome {
 		// HTTP call, and that code must remain.
 		out.Rejected = true
 		out.RejectReason = err.Error()
-		if !sessionHasCaptured(sess) {
-			markExchangeFailed(sess, true)
-		}
+		markExchangeFailedIfNoNewerCode(sess)
 		return out
 	}
 	auth, hard := finishLogin(sess, tok, callbackID)
 	if hard != nil {
+		if sessionSaveFailed(sess) {
+			out.SaveFailed = true
+			return out
+		}
 		out.Hard = hard
 		return out
 	}
@@ -344,6 +360,8 @@ func redeemCaptured(sess *loginSession, callbackID string) redeemOutcome {
 // finishLogin writes codearts-<user>.json through host.auth.save and drops the
 // session. host.auth.save is the same call auth.refresh uses to hand the
 // credential to CPA. A display-name terminal remains until ExpiresAt.
+// A save error leaves the session in place and does not record success.
+// The claimed code is not put back, so it cannot be redeemed twice.
 func finishLogin(sess *loginSession, tok protocol.TokenResponse, callbackID string) (pluginapi.AuthData, *statusError) {
 	if !tok.HasSTS() || strings.TrimSpace(tok.RefreshToken) == "" {
 		return pluginapi.AuthData{}, &statusError{
@@ -366,7 +384,15 @@ func finishLogin(sess *loginSession, tok protocol.TokenResponse, callbackID stri
 		}
 	}
 	fileName := protocol.FileNameFor(cred)
-	_ = hostAuthSave(fileName, raw)
+	if err := hostAuthSave(fileName, raw); err != nil {
+		log.Printf("codearts auth save failed")
+		markSaveFailed(sess)
+		return pluginapi.AuthData{}, &statusError{
+			Code:   "login_error",
+			Status: http.StatusBadGateway,
+			Msg:    "认证文件没有写入。",
+		}
+	}
 	auth := authDataFromCredential(cred, fileName)
 	rememberTerminal(sess, auth.Label)
 	delSession(sess.ID)
@@ -607,7 +633,9 @@ func getSession(id string) *loginSession {
 
 // claimCaptured copies CapturedCode and CapturedSecret. A non-empty code is
 // recorded in claimedCodes and cleared before sessMu is released so this poll
-// owns it. CapturedSecret is left in place. Do not hold sessMu across hostHTTPDo.
+// owns it. exchangeFailed and saveFailed from the previous code are cleared
+// under that same lock. CapturedSecret is left in place. Do not hold sessMu
+// across hostHTTPDo.
 func claimCaptured(sess *loginSession) (code, secret string) {
 	sessMu.Lock()
 	code, secret = sess.CapturedCode, sess.CapturedSecret
@@ -617,6 +645,8 @@ func claimCaptured(sess *loginSession) (code, secret string) {
 		}
 		sess.claimedCodes[code] = struct{}{}
 		sess.CapturedCode = ""
+		sess.exchangeFailed = false
+		sess.saveFailed = false
 	}
 	sessMu.Unlock()
 	return code, secret
@@ -727,10 +757,38 @@ func markExchanging(sess *loginSession, on bool) {
 	sessMu.Unlock()
 }
 
-func markExchangeFailed(sess *loginSession, failed bool) {
+// markExchangeFailedIfNoNewerCode sets exchangeFailed only when no newer
+// authorization code is already stored. The check and the write share sessMu,
+// so a callback that stored a code cannot lose that clear.
+func markExchangeFailedIfNoNewerCode(sess *loginSession) {
 	sessMu.Lock()
-	sess.exchangeFailed = failed
+	if sess.CapturedCode == "" {
+		sess.exchangeFailed = true
+	}
 	sessMu.Unlock()
+}
+
+func markSaveFailed(sess *loginSession) {
+	sessMu.Lock()
+	sess.saveFailed = true
+	sessMu.Unlock()
+}
+
+func sessionSaveFailed(sess *loginSession) bool {
+	sessMu.Lock()
+	defer sessMu.Unlock()
+	return sess.saveFailed
+}
+
+// sessionSaveBlocked is a redeemed code whose file was not written, with no
+// newer code waiting and no exchange in flight.
+func sessionSaveBlocked(sess *loginSession) bool {
+	if sess == nil {
+		return false
+	}
+	sessMu.Lock()
+	defer sessMu.Unlock()
+	return sess.saveFailed && sess.CapturedCode == "" && !sess.exchanging
 }
 
 func sessionBusy(sess *loginSession) bool {
@@ -743,12 +801,6 @@ func sessionExchangeFailed(sess *loginSession) bool {
 	sessMu.Lock()
 	defer sessMu.Unlock()
 	return sess.exchangeFailed && sess.CapturedCode == ""
-}
-
-func sessionHasCaptured(sess *loginSession) bool {
-	sessMu.Lock()
-	defer sessMu.Unlock()
-	return sess.CapturedCode != ""
 }
 
 // ingestPollCallback stores callback material carried on this poll.

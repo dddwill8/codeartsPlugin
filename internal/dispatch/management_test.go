@@ -56,6 +56,13 @@ func TestManagementPageDoesNotCaptureQuery(t *testing.T) {
 		"noopener noreferrer",
 		"createElement('a')",
 		"link.textContent",
+		"let pollGen = 0",
+		"pollAbort.abort()",
+		"gen !== pollGen",
+		"state !== loginState",
+		"new AbortController()",
+		"signal: abort.signal",
+		"pollGen++",
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("page script missing %s", want)
