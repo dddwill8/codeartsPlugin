@@ -42,6 +42,7 @@ func resetForTest(t *testing.T) {
 		sessMu.Lock()
 		sessions = map[string]*loginSession{}
 		sessMu.Unlock()
+		clearResourceBase()
 		SetEndpoints(endpointOverride{})
 		SetCaller(nil)
 		SetHTTPClient(nil)
@@ -51,6 +52,7 @@ func resetForTest(t *testing.T) {
 	sessMu.Lock()
 	sessions = map[string]*loginSession{}
 	sessMu.Unlock()
+	clearResourceBase()
 	SetEndpoints(endpointOverride{})
 	SetCaller(nil)
 	SetHTTPClient(nil)

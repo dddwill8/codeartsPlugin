@@ -6,7 +6,10 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"path"
+	"regexp"
 	"strings"
+	"sync"
 
 	"github.com/dddwill8/codeartsPlugin/internal/protocol"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
@@ -19,8 +22,11 @@ const (
 	managementCallbackFull  = "/v0/management" + managementCallbackRoute
 
 	// resourceCallbackRoute is the CPAMP plugin-menu page. GET only.
+	// CPA prefixes it with ResourceBasePath, which is
+	// /v0/resource/plugins/<id> and <id> comes from the .so filename.
 	resourceCallbackRoute = "/callback"
-	resourceCallbackFull  = "/v0/resource/plugins/" + protocol.PluginID + resourceCallbackRoute
+	resourcePluginsPrefix = "/v0/resource/plugins/"
+	resourceCallbackFull  = resourcePluginsPrefix + protocol.PluginID + resourceCallbackRoute
 
 	// maxCallbackPaste matches the loopback listener body cap. Larger pastes are
 	// rejected before they can be stored on a session.
@@ -30,6 +36,16 @@ const (
 )
 
 var errCallbackTooLarge = errors.New("callback paste too large")
+
+// pluginIDPattern matches CPA pluginIDFromPath. Release files such as
+// codearts-linux-amd64.so have no "-v" version suffix, so the id is the
+// whole basename, not protocol.PluginID.
+var pluginIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+
+var (
+	resourceBaseMu         sync.Mutex
+	registeredResourceBase string
+)
 
 type managementRouteJSON struct {
 	Method      string `json:"Method"`
@@ -51,13 +67,62 @@ type managementRegistrationJSON struct {
 
 // managementResult is the JSON body of the authenticated submit route.
 // Messages are fixed sentences. They do not include the pasted URL, code,
-// secret, ticket, or management key.
+// secret, ticket, or management key. ContinueURL is set only for a first hop,
+// and only to the safe portal redirect.
 type managementResult struct {
-	OK      bool   `json:"ok"`
-	Bound   bool   `json:"bound"`
-	Stored  bool   `json:"stored"`
-	Pending bool   `json:"pending"`
-	Message string `json:"message"`
+	OK          bool   `json:"ok"`
+	Bound       bool   `json:"bound"`
+	Stored      bool   `json:"stored"`
+	Pending     bool   `json:"pending"`
+	Message     string `json:"message"`
+	ContinueURL string `json:"continue_url,omitempty"`
+}
+
+func handleManagementRegister(request []byte) ([]byte, error) {
+	if len(request) > 0 {
+		var req pluginapi.ManagementRegistrationRequest
+		if json.Unmarshal(request, &req) == nil {
+			rememberResourceBase(req.ResourceBasePath)
+		}
+	}
+	return okEnvelope(managementRegistration())
+}
+
+func rememberResourceBase(raw string) {
+	base := cleanResourceBase(raw)
+	if base == "" {
+		return
+	}
+	resourceBaseMu.Lock()
+	registeredResourceBase = base
+	resourceBaseMu.Unlock()
+}
+
+func currentResourceBase() string {
+	resourceBaseMu.Lock()
+	defer resourceBaseMu.Unlock()
+	return registeredResourceBase
+}
+
+func clearResourceBase() {
+	resourceBaseMu.Lock()
+	registeredResourceBase = ""
+	resourceBaseMu.Unlock()
+}
+
+func cleanResourceBase(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || strings.Contains(raw, "..") || strings.ContainsAny(raw, " \t\r\n?#\\") {
+		return ""
+	}
+	if !strings.HasPrefix(raw, "/") {
+		raw = "/" + raw
+	}
+	cleaned := path.Clean(raw)
+	if !strings.HasPrefix(cleaned, "/") || cleaned == "/" {
+		return ""
+	}
+	return cleaned
 }
 
 func managementRegistration() managementRegistrationJSON {
@@ -92,7 +157,7 @@ func handleManagement(request []byte) ([]byte, error) {
 		return managementBytes(http.StatusOK, "text/html; charset=utf-8", pageCSP(), managementPage())
 	case method == http.MethodPost && samePath(req.Path, managementCallbackFull, managementCallbackRoute):
 		return submitManagementCallback(req)
-	case samePath(req.Path, resourceCallbackFull, resourceCallbackRoute):
+	case isResourceCallbackPath(req.Path):
 		// The public resource must not accept a code, even as POST with a body.
 		return managementJSON(http.StatusMethodNotAllowed, managementResult{
 			Message: "这个页面只展示说明，不接收授权码。",
@@ -102,9 +167,43 @@ func handleManagement(request []byte) ([]byte, error) {
 	}
 }
 
-func isCallbackPagePath(path string) bool {
-	return samePath(path, resourceCallbackFull, resourceCallbackRoute) ||
-		samePath(path, managementCallbackFull, managementCallbackRoute)
+func isCallbackPagePath(raw string) bool {
+	if isResourceCallbackPath(raw) {
+		return true
+	}
+	return samePath(raw, managementCallbackFull, managementCallbackRoute)
+}
+
+// isResourceCallbackPath reports whether raw is the paste page.
+// The relative route, the ResourceBasePath from management.register, and any
+// /v0/resource/plugins/<id>/callback all count. The id is the .so basename.
+func isResourceCallbackPath(raw string) bool {
+	requestPath := normalizeRequestPath(raw)
+	if requestPath == "" {
+		return false
+	}
+	if requestPath == resourceCallbackRoute {
+		return true
+	}
+	if base := currentResourceBase(); base != "" && requestPath == base+resourceCallbackRoute {
+		return true
+	}
+	if !strings.HasPrefix(requestPath, resourcePluginsPrefix) {
+		return false
+	}
+	id, route, ok := strings.Cut(strings.TrimPrefix(requestPath, resourcePluginsPrefix), "/")
+	return ok && route == "callback" && pluginIDPattern.MatchString(id)
+}
+
+func normalizeRequestPath(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if !strings.HasPrefix(raw, "/") {
+		raw = "/" + raw
+	}
+	return strings.TrimRight(raw, "/")
 }
 
 func samePath(path, full, rel string) bool {
@@ -142,6 +241,10 @@ type bindOutcome struct {
 // bindPastedCallback stores the paste on one in-flight session and does not
 // exchange it. The next auth.login.poll claims the code once.
 func bindPastedCallback(parts protocol.CallbackParts) bindOutcome {
+	return finishBind(parts, bindPastedCallbackResult(parts))
+}
+
+func bindPastedCallbackResult(parts protocol.CallbackParts) bindOutcome {
 	if parts.Code == "" && parts.Secret == "" {
 		return bindOutcome{
 			Status: http.StatusBadRequest,
@@ -159,10 +262,14 @@ func bindPastedCallback(parts protocol.CallbackParts) bindOutcome {
 			},
 		}
 	}
+	safeRedirect := protocol.SafePortalRedirect(parts.Redirect)
 	sessMu.Lock()
 	capturedCode := sess.CapturedCode
 	capturedSecret := sess.CapturedSecret
 	_, claimed := sess.claimedCodes[parts.Code]
+	if parts.Code == "" && capturedSecret == parts.Secret && safeRedirect != "" {
+		sess.CapturedRedirect = safeRedirect
+	}
 	sessMu.Unlock()
 
 	if parts.Code != "" {
@@ -216,6 +323,18 @@ func bindPastedCallback(parts protocol.CallbackParts) bindOutcome {
 			Message: "进行中的登录已经有 secret，这一条没有写入。",
 		},
 	}
+}
+
+// finishBind adds the portal continue link for a first hop. The fixed message
+// stays free of the URL. A second hop that already has a code does not.
+func finishBind(parts protocol.CallbackParts, out bindOutcome) bindOutcome {
+	if parts.Code != "" {
+		return out
+	}
+	if safe := protocol.SafePortalRedirect(parts.Redirect); safe != "" {
+		out.ContinueURL = safe
+	}
+	return out
 }
 
 func pastedCallbackText(body []byte, query url.Values) (string, error) {
@@ -411,6 +530,7 @@ code{word-break:break-all}
 <button id="submit" type="submit">提交</button>
 </form>
 <p id="result" role="status"></p>
+<p id="continue"></p>
 <noscript><p>需要启用 JavaScript，才能带上管理密钥提交。没有脚本时这个页面不会把 URL 发出去。</p></noscript>
 <script>
 const cfg = __CFG__;
@@ -486,6 +606,30 @@ function resultMessage(status, text){
   if (status === 403) return '需要管理认证。填写和 CPAMP 相同的管理密钥。';
   return '提交失败（' + status + '）';
 }
+function keepURL(data){
+  return !data || data.stored !== true || data.pending === true;
+}
+function portalContinueURL(url){
+  if (typeof url !== 'string' || url === '') return '';
+  let parsed;
+  try { parsed = new URL(url); } catch (e) { return ''; }
+  if (parsed.protocol !== 'https:' || parsed.username || parsed.password) return '';
+  const host = parsed.hostname.toLowerCase();
+  if (host !== 'codearts.huaweicloud.com' && !host.endsWith('.huaweicloud.com')) return '';
+  return url;
+}
+function showContinue(url){
+  const box = document.getElementById('continue');
+  box.replaceChildren();
+  const safe = portalContinueURL(url);
+  if (!safe) return;
+  const link = document.createElement('a');
+  link.href = safe;
+  link.target = '_blank';
+  link.rel = 'noopener noreferrer';
+  link.textContent = '继续华为授权';
+  box.appendChild(link);
+}
 keyBox.value = savedKey();
 form.addEventListener('submit', async function (ev) {
   ev.preventDefault();
@@ -494,6 +638,7 @@ form.addEventListener('submit', async function (ev) {
   result.textContent = '';
   if (!pasted) {
     result.textContent = '先粘贴地址栏里的完整 URL。';
+    showContinue('');
     return;
   }
   if (!key) {
@@ -512,9 +657,11 @@ form.addEventListener('submit', async function (ev) {
       credentials: 'same-origin'
     });
     const text = await resp.text();
+    let data = null;
+    try { data = JSON.parse(text); } catch (e) {}
     result.textContent = resultMessage(resp.status, text);
-    const retry = resp.status === 403 || resp.status === 400 || resp.status === 413;
-    if (!retry) urlBox.value = '';
+    if (!keepURL(data)) urlBox.value = '';
+    showContinue(data && data.continue_url);
     rememberKey(key, resp.status !== 403);
   } catch (e) {
     result.textContent = '提交没有送到 CPA。确认这个页面是从 CPA 打开的。';

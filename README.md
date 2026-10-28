@@ -37,7 +37,7 @@ make plugin PLATFORM=linux/amd64  # 在 ARM 机器上编 x86
 
 文件放进 CPA 的 `plugins/linux/arm64/` 或 `plugins/linux/amd64/`。替换后要重启 CPA 进程，新的 `.so` 才会被加载。
 
-编好的文件在 [v0.1.0](https://github.com/dddwill8/codeartsPlugin/releases/tag/v0.1.0)：`codearts-linux-arm64.so`、`codearts-linux-amd64.so`。
+编好的文件在 [v0.1.1](https://github.com/dddwill8/codeartsPlugin/releases/tag/v0.1.1)：`codearts-linux-arm64.so`、`codearts-linux-amd64.so`。
 
 本地试用时，`make compose-up` 会拉起 CPA 并挂上刚编好的插件。接口在 `http://127.0.0.1:8317`（API 密钥 `codearts-test-key`），管理页在 `http://127.0.0.1:8317/management.html`（管理密钥 `codearts-mgmt-key`）。回调端口默认 `18080`。
 

@@ -80,7 +80,7 @@ func Handle(method string, request []byte) ([]byte, error) {
 	case pluginabi.MethodExecutorHTTPRequest:
 		return handleExecutorHTTP(request)
 	case pluginabi.MethodManagementRegister:
-		return okEnvelope(managementRegistration())
+		return handleManagementRegister(request)
 	case pluginabi.MethodManagementHandle:
 		return handleManagement(request)
 	default:

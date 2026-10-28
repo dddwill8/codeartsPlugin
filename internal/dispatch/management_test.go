@@ -41,6 +41,29 @@ func TestManagementPageDoesNotCaptureQuery(t *testing.T) {
 	if strings.Contains(htmlBody, leaked) {
 		t.Fatal("resource page reflected the query code")
 	}
+	script := htmlBody[strings.Index(htmlBody, "<script>"):]
+	for _, want := range []string{
+		"function keepURL(data)",
+		"data.stored !== true",
+		"data.pending === true",
+		"data.continue_url",
+		"function portalContinueURL(url)",
+		"parsed.protocol !== 'https:'",
+		"codearts.huaweicloud.com",
+		".huaweicloud.com",
+		"继续华为授权",
+		`link.target = '_blank'`,
+		"noopener noreferrer",
+		"createElement('a')",
+		"link.textContent",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("page script missing %s", want)
+		}
+	}
+	if strings.Contains(script, "innerHTML") {
+		t.Fatal("page script assigns innerHTML")
+	}
 	code, secret, ok := capturedOf(t, start.State)
 	if !ok || code != "" || secret != "" {
 		t.Fatalf("captured code=%q secret=%q ok=%v", code, secret, ok)
@@ -60,6 +83,75 @@ func TestManagementPageDoesNotCaptureQuery(t *testing.T) {
 	code, _, ok = capturedOf(t, start.State)
 	if !ok || code != "" {
 		t.Fatalf("captured after resource POST code=%q", code)
+	}
+}
+
+func TestManagementPageAcceptsFilenamePluginID(t *testing.T) {
+	resetForTest(t)
+	const leaked = "filename-id-must-not-bind"
+	start := startBareLogin(t)
+	for _, id := range []string{"codearts-linux-amd64", "codearts-linux-arm64"} {
+		pagePath := "/v0/resource/plugins/" + id + "/callback"
+		status, _, body := callManagement(t, pluginapi.ManagementRequest{
+			Method: http.MethodGet,
+			Path:   pagePath + "/",
+			Query:  url.Values{"code": []string{leaked}},
+		})
+		if status != http.StatusOK || !strings.Contains(string(body), managementMenuName) || strings.Contains(string(body), leaked) {
+			t.Fatalf("%s status=%d body leaked=%t", id, status, strings.Contains(string(body), leaked))
+		}
+		postStatus, postResult, postBody := callManagement(t, pluginapi.ManagementRequest{
+			Method:  http.MethodPost,
+			Path:    pagePath,
+			Headers: managementHeaders("test-mgmt"),
+			Body:    []byte(`{"url":"http://127.0.0.1:18080/oauth/callback?code=` + leaked + `"}`),
+		})
+		if postStatus != http.StatusMethodNotAllowed || postResult.Stored || strings.Contains(string(postBody), leaked) {
+			t.Fatalf("%s POST status=%d result=%+v body=%s", id, postStatus, postResult, postBody)
+		}
+	}
+	code, _, ok := capturedOf(t, start.State)
+	if !ok || code != "" {
+		t.Fatalf("captured=%q ok=%v", code, ok)
+	}
+	for _, path := range []string{
+		"/v0/resource/plugins/codearts-linux-amd64/other",
+		"/v0/resource/plugins/../callback",
+		"/v0/resource/plugins/callback",
+	} {
+		status, _, _ := callManagement(t, pluginapi.ManagementRequest{Method: http.MethodGet, Path: path})
+		if status != http.StatusNotFound {
+			t.Fatalf("%s status=%d", path, status)
+		}
+	}
+
+	const custom = "/assigned/codearts-linux-amd64"
+	status, _, _ := callManagement(t, pluginapi.ManagementRequest{Method: http.MethodGet, Path: custom + "/callback"})
+	if status != http.StatusNotFound {
+		t.Fatalf("custom base matched before register, status=%d", status)
+	}
+	reg, err := json.Marshal(pluginapi.ManagementRegistrationRequest{ResourceBasePath: custom})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env := mustHandle(t, pluginabi.MethodManagementRegister, reg); !env.OK {
+		t.Fatal("management.register failed")
+	}
+	status, _, body := callManagement(t, pluginapi.ManagementRequest{Method: http.MethodGet, Path: custom + "/callback"})
+	if status != http.StatusOK || !strings.Contains(string(body), managementMenuName) {
+		t.Fatalf("registered base status=%d", status)
+	}
+	_ = mustResult(t, pluginabi.MethodManagementRegister, nil)
+	status, _, _ = callManagement(t, pluginapi.ManagementRequest{Method: http.MethodGet, Path: custom + "/callback"})
+	if status != http.StatusOK {
+		t.Fatalf("empty register cleared the resource base, status=%d", status)
+	}
+	status, _, _ = callManagement(t, pluginapi.ManagementRequest{
+		Method: http.MethodGet,
+		Path:   "/v0/resource/plugins/codearts-linux-arm64/callback",
+	})
+	if status != http.StatusOK {
+		t.Fatalf("release id after register status=%d", status)
 	}
 }
 
@@ -115,6 +207,9 @@ func TestManagementPostBindsHuaweiStateThenPollExchangesOnce(t *testing.T) {
 	}
 	if !strings.Contains(result.Message, "已交给进行中的登录") || !strings.Contains(result.Message, "等待插件认证中") {
 		t.Fatalf("message=%q", result.Message)
+	}
+	if result.ContinueURL != "" {
+		t.Fatalf("code submit returned a continue link: %q", result.ContinueURL)
 	}
 	if strings.Contains(string(body), code) || strings.Contains(logs.String(), code) || strings.Contains(logs.String(), "huawei-minted-state") {
 		t.Fatalf("response or log leaked the callback\nbody=%s\nlog=%s", body, logs.String())
@@ -232,15 +327,38 @@ func TestManagementPostFirstHopStaysPending(t *testing.T) {
 	stub := &pollPasteStub{}
 	beginPollPaste(t, stub)
 	start := startPollPasteLogin(t)
-	status, result, body := submitCallback(t, firstHopCallbackURL(pollPastePortalSecret))
+	rawURL := firstHopCallbackURL(pollPastePortalSecret)
+	safe := protocol.SafePortalRedirect(protocol.ParseCallback(rawURL).Redirect)
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	status, result, body := submitCallback(t, rawURL)
 	if status != http.StatusOK || !result.Pending || !result.Stored {
 		t.Fatalf("status=%d result=%+v", status, result)
 	}
 	if !strings.Contains(result.Message, "已记下 secret") || !strings.Contains(result.Message, "第一跳") || !strings.Contains(result.Message, "没有换票") {
 		t.Fatalf("message=%q", result.Message)
 	}
-	if strings.Contains(string(body), pollPastePortalSecret) {
-		t.Fatal("response echoed the secret")
+	if safe == "" || result.ContinueURL != safe {
+		t.Fatalf("continue=%q safe=%q", result.ContinueURL, safe)
+	}
+	if strings.Contains(result.ContinueURL, "127.0.0.1") || strings.Contains(result.Message, pollPastePortalSecret) || strings.Contains(result.Message, "huaweicloud") {
+		t.Fatalf("message or continue link echoed the loopback callback: %+v", result)
+	}
+	if strings.Contains(logs.String(), pollPastePortalSecret) || strings.Contains(logs.String(), "huaweicloud") || strings.Contains(logs.String(), result.ContinueURL) {
+		t.Fatalf("log leaked the callback: %s", logs.String())
+	}
+	sessMu.Lock()
+	storedRedirect := ""
+	if sess := sessions[start.State]; sess != nil {
+		storedRedirect = sess.CapturedRedirect
+	}
+	sessMu.Unlock()
+	if storedRedirect != safe {
+		t.Fatalf("stored redirect=%q", storedRedirect)
+	}
+	if !strings.Contains(string(body), "continue_url") {
+		t.Fatal("response omitted the continue link")
 	}
 	if stub.tokenHits != 0 {
 		t.Fatalf("token hits=%d", stub.tokenHits)
@@ -256,6 +374,64 @@ func TestManagementPostFirstHopStaysPending(t *testing.T) {
 	}
 	if stub.tokenHits != 0 {
 		t.Fatalf("poll token hits=%d", stub.tokenHits)
+	}
+}
+
+func TestManagementPostUnboundFirstHopKeepsContinueLink(t *testing.T) {
+	resetForTest(t)
+	rawURL := firstHopCallbackURL(pollPastePortalSecret)
+	safe := protocol.SafePortalRedirect(protocol.ParseCallback(rawURL).Redirect)
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	status, result, _ := submitCallback(t, rawURL)
+	if status != http.StatusConflict || result.Bound || result.Stored || result.Pending {
+		t.Fatalf("status=%d result=%+v", status, result)
+	}
+	if safe == "" || result.ContinueURL != safe {
+		t.Fatalf("continue=%q safe=%q", result.ContinueURL, safe)
+	}
+	if strings.Contains(result.Message, pollPastePortalSecret) || strings.Contains(result.Message, "huaweicloud") {
+		t.Fatalf("message=%q", result.Message)
+	}
+	if strings.Contains(logs.String(), pollPastePortalSecret) || strings.Contains(logs.String(), "huaweicloud") {
+		t.Fatalf("log leaked the callback: %s", logs.String())
+	}
+	sessMu.Lock()
+	n := len(sessions)
+	sessMu.Unlock()
+	if n != 0 {
+		t.Fatalf("sessions=%d", n)
+	}
+}
+
+func TestManagementPostOmitsUnsafeContinueLink(t *testing.T) {
+	for _, redirect := range []string{
+		"https://evil.example/login",
+		"javascript:alert(1)",
+		"http://codearts.huaweicloud.com/portal/login",
+	} {
+		t.Run(redirect, func(t *testing.T) {
+			resetForTest(t)
+			start := startBareLogin(t)
+			rawURL := "http://127.0.0.1:18080/oauth/callback?secret=portal-secret&redirect=" + url.QueryEscape(redirect)
+			status, result, body := submitCallback(t, rawURL)
+			if status != http.StatusOK || !result.Stored || !result.Pending {
+				t.Fatalf("status=%d result=%+v", status, result)
+			}
+			if result.ContinueURL != "" || strings.Contains(string(body), "evil.example") || strings.Contains(string(body), "javascript:") {
+				t.Fatalf("unsafe redirect returned: %+v %s", result, body)
+			}
+			sessMu.Lock()
+			stored := ""
+			if sess := sessions[start.State]; sess != nil {
+				stored = sess.CapturedRedirect
+			}
+			sessMu.Unlock()
+			if stored != "" {
+				t.Fatalf("stored redirect %q", stored)
+			}
+		})
 	}
 }
 
