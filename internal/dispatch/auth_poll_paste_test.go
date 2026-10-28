@@ -82,7 +82,9 @@ func TestPollPasteBindsPollStateNotForeignState(t *testing.T) {
 		stub := &pollPasteStub{}
 		beginPollPaste(t, stub)
 		older := startPollPasteLogin(t)
+		restoreOlder := keepSession(t, older.State)
 		newer := startPollPasteLogin(t)
+		restoreOlder()
 		if older.State == newer.State {
 			t.Fatal("login states collided")
 		}
@@ -115,7 +117,9 @@ func TestPollPasteBindsPollStateNotForeignState(t *testing.T) {
 		stub := &pollPasteStub{}
 		beginPollPaste(t, stub)
 		older := startPollPasteLogin(t)
+		restoreOlder := keepSession(t, older.State)
 		newer := startPollPasteLogin(t)
+		restoreOlder()
 		pasted := "http://127.0.0.1/oauth/callback?code=bound-newer&state=" + newer.State
 		req, _ := json.Marshal(map[string]any{
 			"State":        older.State,
@@ -218,7 +222,7 @@ func TestPollAuthDirFileCode(t *testing.T) {
 	})
 }
 
-func TestPollPasteDiscardsMissingState(t *testing.T) {
+func TestPollPasteSoleSessionBindsUnknownState(t *testing.T) {
 	stub := &pollPasteStub{}
 	beginPollPaste(t, stub)
 	start := startPollPasteLogin(t)
@@ -228,15 +232,46 @@ func TestPollPasteDiscardsMissingState(t *testing.T) {
 		"redirect_url": pasted,
 	})
 	resp := pollLogin(t, req)
+	if resp.Status != pluginapi.AuthLoginStatusSuccess {
+		t.Fatalf("status=%q message=%q", resp.Status, resp.Message)
+	}
+	if stub.tokenHits != 1 || stub.code != "should-drop" {
+		t.Fatalf("token hits=%d code=%q body=%s", stub.tokenHits, stub.code, stub.tokenBody)
+	}
+}
+
+func TestPollPasteTwoSessionsDiscardUnknownState(t *testing.T) {
+	stub := &pollPasteStub{}
+	beginPollPaste(t, stub)
+	older := startPollPasteLogin(t)
+	restoreOlder := keepSession(t, older.State)
+	newer := startPollPasteLogin(t)
+	restoreOlder()
+	pasted := "http://127.0.0.1/oauth/callback?code=should-drop&state=missing-state"
+	req, _ := json.Marshal(map[string]any{
+		"State":        older.State,
+		"redirect_url": pasted,
+	})
+	resp := pollLogin(t, req)
 	if resp.Status != pluginapi.AuthLoginStatusPending {
 		t.Fatalf("status=%q message=%q", resp.Status, resp.Message)
 	}
 	if stub.tokenHits != 0 {
 		t.Fatalf("token hits=%d body=%s", stub.tokenHits, stub.tokenBody)
 	}
-	code, secret, ok := capturedOf(t, start.State)
-	if !ok || code != "" || secret != "" {
-		t.Fatalf("sole session captured code=%q secret=%q ok=%v", code, secret, ok)
+	for _, id := range []string{older.State, newer.State} {
+		code, secret, ok := capturedOf(t, id)
+		if !ok || code != "" || secret != "" {
+			t.Fatalf("session %s captured code=%q secret=%q ok=%v", id, code, secret, ok)
+		}
+	}
+	ticketReq := httptest.NewRequest(http.MethodGet, "/oauth/callback?code=should-drop-ticket&ticket_id=missing-ticket", nil)
+	handleOAuthCallbackHTTP(httptest.NewRecorder(), ticketReq)
+	for _, id := range []string{older.State, newer.State} {
+		code, secret, ok := capturedOf(t, id)
+		if !ok || code != "" || secret != "" {
+			t.Fatalf("session %s stored unknown ticket code=%q secret=%q ok=%v", id, code, secret, ok)
+		}
 	}
 }
 

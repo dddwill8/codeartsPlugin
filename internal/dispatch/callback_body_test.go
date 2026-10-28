@@ -48,9 +48,15 @@ func TestOAuthCallbackBodySecret(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/oauth/callback", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 	handleOAuthCallbackHTTP(rec, req)
-	html := rec.Body.String()
-	if strings.Contains(html, "登录失败") {
-		t.Fatalf("callback page says login failed:\n%s", html)
+	htmlBody := rec.Body.String()
+	if strings.Contains(htmlBody, "登录失败") {
+		t.Fatalf("callback page says login failed:\n%s", htmlBody)
+	}
+	if !strings.Contains(htmlBody, "secret 已记在本地") || !strings.Contains(htmlBody, "登录尚未完成") {
+		t.Fatalf("bound first hop page:\n%s", htmlBody)
+	}
+	if strings.Contains(htmlBody, "127.0.0.1") || strings.Contains(htmlBody, "/oauth/callback") || strings.Contains(htmlBody, "code=") || strings.Contains(htmlBody, "已接收授权码") {
+		t.Fatalf("first hop offers a submittable URL:\n%s", htmlBody)
 	}
 
 	pollReq, _ := json.Marshal(map[string]any{"State": start.State})

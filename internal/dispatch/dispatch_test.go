@@ -2,6 +2,7 @@ package dispatch
 
 import (
 	"encoding/json"
+	"html"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,26 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
+
+// keepSession returns a function that puts id back after a later login start
+// removes it. Use it only when a test needs two sessions on purpose.
+func keepSession(t *testing.T, id string) func() {
+	t.Helper()
+	sessMu.Lock()
+	s := sessions[id]
+	sessMu.Unlock()
+	if s == nil {
+		t.Fatalf("missing session %s", id)
+	}
+	return func() {
+		sessMu.Lock()
+		if sessions == nil {
+			sessions = map[string]*loginSession{}
+		}
+		sessions[id] = s
+		sessMu.Unlock()
+	}
+}
 
 func resetForTest(t *testing.T) {
 	t.Helper()
@@ -654,11 +675,21 @@ func TestOAuthCallbackHTTPFirstHopDoesNotRedirectOrFail(t *testing.T) {
 	if !strings.Contains(body, "portal/login") {
 		t.Fatalf("callback page missing continue URL:\n%s", body)
 	}
+	if strings.Contains(body, "已接收授权码") || strings.Contains(body, "已记在本地") || strings.Contains(body, "127.0.0.1") || strings.Contains(body, "/oauth/callback") {
+		t.Fatalf("unbound first hop offers a callback URL:\n%s", body)
+	}
+	if !strings.Contains(body, "未绑定到进行中的登录") {
+		t.Fatalf("unbound first hop body:\n%s", body)
+	}
 
 	empty := httptest.NewRecorder()
 	handleOAuthCallbackHTTP(empty, httptest.NewRequest(http.MethodGet, "/oauth/callback", nil))
-	if strings.Contains(empty.Body.String(), "登录失败") {
-		t.Fatalf("empty callback must not say login failed:\n%s", empty.Body.String())
+	emptyBody := empty.Body.String()
+	if strings.Contains(emptyBody, "登录失败") {
+		t.Fatalf("empty callback must not say login failed:\n%s", emptyBody)
+	}
+	if strings.Contains(emptyBody, "127.0.0.1") || strings.Contains(emptyBody, "/oauth/callback") || strings.Contains(emptyBody, "粘贴") {
+		t.Fatalf("empty callback offers a paste URL:\n%s", emptyBody)
 	}
 }
 
@@ -699,6 +730,16 @@ func TestCallbackDiscardUnlessStateTicketOrSoleSession(t *testing.T) {
 		}
 		return s.TicketID
 	}
+	portOf := func(id string) int {
+		t.Helper()
+		sessMu.Lock()
+		defer sessMu.Unlock()
+		s := sessions[id]
+		if s == nil || s.Port <= 0 {
+			t.Fatalf("missing port for %s", id)
+		}
+		return s.Port
+	}
 	clearSessions := func() {
 		sessMu.Lock()
 		sessions = map[string]*loginSession{}
@@ -706,7 +747,9 @@ func TestCallbackDiscardUnlessStateTicketOrSoleSession(t *testing.T) {
 	}
 
 	older := start()
+	restoreOlder := keepSession(t, older.State)
 	newer := start()
+	restoreOlder()
 	if older.State == newer.State {
 		t.Fatal("login states collided")
 	}
@@ -714,8 +757,12 @@ func TestCallbackDiscardUnlessStateTicketOrSoleSession(t *testing.T) {
 	applyPastedCallback("http://127.0.0.1:18080/oauth/callback?code=loose-code&secret=portal-secret-unmatched")
 	rec := httptest.NewRecorder()
 	handleOAuthCallbackHTTP(rec, httptest.NewRequest(http.MethodGet, "/oauth/callback?code=http-loose-code&secret=portal-secret-http", nil))
-	if !strings.Contains(rec.Body.String(), "已接收授权码") {
-		t.Fatalf("unbound code callback body:\n%s", rec.Body.String())
+	unbound := rec.Body.String()
+	if strings.Contains(unbound, "已接收授权码") || strings.Contains(unbound, "/oauth/callback?") || strings.Contains(unbound, older.State) || strings.Contains(unbound, newer.State) {
+		t.Fatalf("unbound code callback offers a paste URL:\n%s", unbound)
+	}
+	if !strings.Contains(unbound, "未绑定到进行中的登录") {
+		t.Fatalf("unbound code callback body:\n%s", unbound)
 	}
 	for _, id := range []string{older.State, newer.State} {
 		code, secret := snap(id)
@@ -763,9 +810,49 @@ func TestCallbackDiscardUnlessStateTicketOrSoleSession(t *testing.T) {
 		t.Fatalf("second secret overwrote capture: %q", secret)
 	}
 
+	q = url.Values{}
+	q.Set("code", "newer-via-ticket")
+	q.Set("state", "not-a-session")
+	q.Set("ticket_id", ticketOf(newer.State))
+	recTicket := httptest.NewRecorder()
+	handleOAuthCallbackHTTP(recTicket, httptest.NewRequest(http.MethodGet, "/oauth/callback?"+q.Encode(), nil))
+	if code, secret := snap(newer.State); code != "newer-via-ticket" || secret != "" {
+		t.Fatalf("newer after foreign state + own ticket code=%q secret=%q", code, secret)
+	}
+	if code, secret := snap(older.State); code != "older-code" || secret != "portal-secret-older" {
+		t.Fatalf("older changed by newer ticket code=%q secret=%q", code, secret)
+	}
+	wantNewer := managementCallbackURL(portOf(newer.State), "newer-via-ticket", newer.State)
+	if !strings.Contains(recTicket.Body.String(), html.EscapeString(wantNewer)) || strings.Contains(recTicket.Body.String(), "not-a-session") || strings.Contains(recTicket.Body.String(), older.State) {
+		t.Fatalf("ticket-bound page:\n%s", recTicket.Body.String())
+	}
+
+	for _, raw := range []string{
+		"/oauth/callback?code=unknown-state-code&state=missing-state",
+		"/oauth/callback?code=unknown-ticket-code&ticket_id=missing-ticket",
+	} {
+		unknownRec := httptest.NewRecorder()
+		handleOAuthCallbackHTTP(unknownRec, httptest.NewRequest(http.MethodGet, raw, nil))
+		unknownBody := unknownRec.Body.String()
+		if strings.Contains(unknownBody, "已接收授权码") || strings.Contains(unknownBody, "/oauth/callback?") || strings.Contains(unknownBody, older.State) || strings.Contains(unknownBody, newer.State) {
+			t.Fatalf("unknown callback with two sessions:\n%s", unknownBody)
+		}
+		if !strings.Contains(unknownBody, "未绑定到进行中的登录") {
+			t.Fatalf("unknown callback body:\n%s", unknownBody)
+		}
+	}
+	if code, secret := snap(older.State); code != "older-code" || secret != "portal-secret-older" {
+		t.Fatalf("unknown callback wrote older code=%q secret=%q", code, secret)
+	}
+	if code, secret := snap(newer.State); code != "newer-via-ticket" || secret != "" {
+		t.Fatalf("unknown callback wrote newer code=%q secret=%q", code, secret)
+	}
+
 	clearSessions()
 	bodyOlder := start()
+	restoreBodyOlder := keepSession(t, bodyOlder.State)
 	bodyNewer := start()
+	restoreBodyOlder()
 	body := url.Values{}
 	body.Set("code", "body-code")
 	body.Set("ticket_id", ticketOf(bodyOlder.State))
@@ -780,15 +867,129 @@ func TestCallbackDiscardUnlessStateTicketOrSoleSession(t *testing.T) {
 
 	clearSessions()
 	only := start()
-	handleOAuthCallbackHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/oauth/callback?code=should-drop&state=missing-state", nil))
-	handleOAuthCallbackHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/oauth/callback?code=should-drop-ticket&ticket_id=missing-ticket", nil))
-	if code, secret := snap(only.State); code != "" || secret != "" {
-		t.Fatalf("unknown state or ticket attached to the sole session code=%q secret=%q", code, secret)
+	sessMu.Lock()
+	sessions[only.State].Port = 19091
+	sessMu.Unlock()
+	q = url.Values{}
+	q.Set("code", "ab/cd")
+	q.Set("state", "missing-state")
+	onlyRec := httptest.NewRecorder()
+	handleOAuthCallbackHTTP(onlyRec, httptest.NewRequest(http.MethodGet, "/oauth/callback?"+q.Encode(), nil))
+	onlyBody := onlyRec.Body.String()
+	wantOnly := managementCallbackURL(19091, "ab/cd", only.State)
+	if !strings.Contains(onlyBody, html.EscapeString(wantOnly)) || strings.Contains(onlyBody, "missing-state") {
+		t.Fatalf("sole unknown state page:\n%s", onlyBody)
 	}
+	pasted := pasteURLFromCallbackPage(t, onlyBody)
+	parsed, err := url.Parse(pasted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Query().Get("code") != "ab/cd" || parsed.Query().Get("state") != only.State {
+		t.Fatalf("CPA query code=%q state=%q", parsed.Query().Get("code"), parsed.Query().Get("state"))
+	}
+	if code, secret := snap(only.State); code != "ab/cd" || secret != "" {
+		t.Fatalf("sole unknown state code=%q secret=%q", code, secret)
+	}
+	handleOAuthCallbackHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/oauth/callback?code=other-code&state=still-missing", nil))
+	if code, _ := snap(only.State); code != "ab/cd" {
+		t.Fatalf("second code overwrote sole capture: %q", code)
+	}
+
+	clearSessions()
+	onlyTicket := start()
+	ticketRec := httptest.NewRecorder()
+	handleOAuthCallbackHTTP(ticketRec, httptest.NewRequest(http.MethodGet, "/oauth/callback?code=should-drop-ticket&ticket_id=missing-ticket", nil))
+	wantTicket := managementCallbackURL(portOf(onlyTicket.State), "should-drop-ticket", onlyTicket.State)
+	if !strings.Contains(ticketRec.Body.String(), html.EscapeString(wantTicket)) || strings.Contains(ticketRec.Body.String(), "missing-ticket") {
+		t.Fatalf("sole unknown ticket page:\n%s", ticketRec.Body.String())
+	}
+	if code, secret := snap(onlyTicket.State); code != "should-drop-ticket" || secret != "" {
+		t.Fatalf("sole unknown ticket code=%q secret=%q", code, secret)
+	}
+
+	clearSessions()
+	onlyBare := start()
 	applyPastedCallback("http://127.0.0.1:18080/oauth/callback?code=sole-code")
-	if code, _ := snap(only.State); code != "sole-code" {
+	if code, _ := snap(onlyBare.State); code != "sole-code" {
 		t.Fatalf("sole session did not bind code: %q", code)
 	}
+}
+
+func TestLoginStartReplacesPreviousSession(t *testing.T) {
+	resetForTest(t)
+	regReq, _ := json.Marshal(lifecycleRequest{ConfigYAML: []byte("oauth_callback_port: 0\n")})
+	_ = mustResult(t, pluginabi.MethodPluginRegister, regReq)
+
+	firstRaw := mustResult(t, pluginabi.MethodAuthLoginStart, nil)
+	var first pluginapi.AuthLoginStartResponse
+	if err := json.Unmarshal(firstRaw, &first); err != nil {
+		t.Fatal(err)
+	}
+	secondRaw := mustResult(t, pluginabi.MethodAuthLoginStart, nil)
+	var second pluginapi.AuthLoginStartResponse
+	if err := json.Unmarshal(secondRaw, &second); err != nil {
+		t.Fatal(err)
+	}
+	sessMu.Lock()
+	_, firstAlive := sessions[first.State]
+	_, secondAlive := sessions[second.State]
+	n := len(sessions)
+	port := 0
+	if sessions[second.State] != nil {
+		port = sessions[second.State].Port
+	}
+	sessMu.Unlock()
+	if firstAlive || !secondAlive || n != 1 || first.State == second.State {
+		t.Fatalf("sessions=%d firstAlive=%v secondAlive=%v", n, firstAlive, secondAlive)
+	}
+
+	const huaweiState = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const huaweiCode = "sample-auth-code"
+	q := url.Values{}
+	q.Set("code", huaweiCode)
+	q.Set("state", huaweiState)
+	rec := httptest.NewRecorder()
+	handleOAuthCallbackHTTP(rec, httptest.NewRequest(http.MethodGet, "/oauth/callback?"+q.Encode(), nil))
+	body := rec.Body.String()
+	if strings.Contains(body, "未绑定到进行中的登录") || strings.Contains(body, huaweiState) {
+		t.Fatalf("callback page:\n%s", body)
+	}
+	want := managementCallbackURL(port, huaweiCode, second.State)
+	if !strings.Contains(body, html.EscapeString(want)) {
+		t.Fatalf("page missing %s\n%s", want, body)
+	}
+	parsed, err := url.Parse(pasteURLFromCallbackPage(t, body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Query().Get("state") != second.State || parsed.Query().Get("code") != huaweiCode {
+		t.Fatalf("CPA query code=%q state=%q", parsed.Query().Get("code"), parsed.Query().Get("state"))
+	}
+	sessMu.Lock()
+	got := ""
+	if sessions[second.State] != nil {
+		got = sessions[second.State].CapturedCode
+	}
+	sessMu.Unlock()
+	if got != huaweiCode {
+		t.Fatalf("captured %q", got)
+	}
+}
+
+func pasteURLFromCallbackPage(t *testing.T, body string) string {
+	t.Helper()
+	const marker = "http://127.0.0.1:"
+	i := strings.Index(body, marker)
+	if i < 0 {
+		t.Fatalf("callback page has no paste URL:\n%s", body)
+	}
+	rest := body[i:]
+	j := strings.Index(rest, "<")
+	if j < 0 {
+		t.Fatalf("callback page URL is not closed:\n%s", body)
+	}
+	return html.UnescapeString(rest[:j])
 }
 
 func TestManagementRegisterHasNoPluginPage(t *testing.T) {

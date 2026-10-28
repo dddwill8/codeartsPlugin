@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -165,7 +166,7 @@ func handleLoginPoll(request []byte) ([]byte, error) {
 	tok, err := pollTicket(callbackID, lc, sess, capturedSecret)
 	msg := "waiting for Huawei authorization code"
 	if capturedSecret != "" {
-		msg = "received portal secret; continue Huawei login, then paste the callback URL that contains code="
+		msg = "received portal secret; continue Huawei login, then paste the callback page URL that has this session's state and code="
 	}
 	if err != nil {
 		msg = "pending: " + err.Error()
@@ -479,8 +480,10 @@ func nextRefreshFromExpiration(expiration string) time.Time {
 func putSession(s *loginSession) {
 	sessMu.Lock()
 	defer sessMu.Unlock()
-	gcSessionsLocked()
-	sessions[s.ID] = s
+	// One in-flight login. CPA cancel does not reach the plugin, so a previous
+	// attempt stays until it expires. Huawei then returns its own state, which
+	// matches none of those sessions, and the callback is dropped.
+	sessions = map[string]*loginSession{s.ID: s}
 }
 
 func getSession(id string) *loginSession {
@@ -720,9 +723,9 @@ func parseOAuthCodeFile(raw []byte) (code, state, oauthErr string) {
 }
 
 // captureCallback binds a callback to one in-flight session.
-// A non-empty state selects only sessions[state]. Otherwise a non-empty
-// ticketID selects only that TicketID. With neither, it binds only when
-// exactly one session is in flight. Any other callback is discarded.
+// A state or ticketID that hits a session selects only that session. When
+// neither hits, exactly one in-flight session still receives the callback.
+// Two or more in-flight sessions discard an unmatched state or ticketID.
 // A code already claimed by this session is not written to CapturedCode.
 // A non-empty CapturedCode or CapturedSecret is not replaced by a different value.
 func captureCallback(code, secret, state, ticketID string) *loginSession {
@@ -734,6 +737,7 @@ func captureCallback(code, secret, state, ticketID string) *loginSession {
 	gcSessionsLocked()
 	sess := matchCallbackSessionLocked(state, ticketID)
 	if sess == nil {
+		log.Printf("codearts oauth callback unbound sessions=%d state_len=%d ticket=%t", len(sessions), len(state), ticketID != "")
 		return nil
 	}
 	if code != "" {
@@ -748,22 +752,30 @@ func captureCallback(code, secret, state, ticketID string) *loginSession {
 	return sess
 }
 
+// matchCallbackSessionLocked selects the in-flight session for a callback.
+// A state equal to a session ID wins. Otherwise a ticketID equal to exactly
+// one session's TicketID wins. When neither hits, exactly one in-flight
+// session still receives the callback, including a state or ticketID Huawei
+// minted. Two or more in-flight sessions discard that unmatched callback.
 func matchCallbackSessionLocked(state, ticketID string) *loginSession {
 	if state != "" {
-		return sessions[state]
+		if sess := sessions[state]; sess != nil {
+			return sess
+		}
 	}
 	if ticketID != "" {
 		var found *loginSession
+		matches := 0
 		for _, s := range sessions {
 			if s.TicketID != ticketID {
 				continue
 			}
-			if found != nil {
-				return nil
-			}
+			matches++
 			found = s
 		}
-		return found
+		if matches == 1 {
+			return found
+		}
 	}
 	if len(sessions) != 1 {
 		return nil
