@@ -70,6 +70,12 @@ func TestManagementPageDoesNotCaptureQuery(t *testing.T) {
 		"if (loginState) resumeLogin();",
 		"loginPhase !== 'terminal'",
 		"登录仍在进行",
+		"function finishedLogin(",
+		"data.done === true || data.bound === true",
+		"没能查询这次登录的状态",
+		"popup.close()",
+		"saved.phase === 'terminal'",
+		"saved.phase === 'pending'",
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("page script missing %s", want)
@@ -86,6 +92,24 @@ func TestManagementPageDoesNotCaptureQuery(t *testing.T) {
 	}
 	if !strings.Contains(resumeBody, "refreshSaved") {
 		t.Fatal("resumeLogin does not query the saved session")
+	}
+	formAt := strings.Index(script, "form.addEventListener")
+	if clickAt < 0 || formAt < clickAt {
+		t.Fatal("login click handler is missing")
+	}
+	clickBody := script[clickAt:formAt]
+	openAt := strings.Index(clickBody, "window.open")
+	awaitAt := strings.Index(clickBody, "await ")
+	if openAt < 0 || awaitAt < 0 || openAt > awaitAt {
+		t.Fatal("window.open runs after an await")
+	}
+	stayAt := strings.Index(clickBody, "finishedLogin")
+	startAt := strings.Index(clickBody, "cfg.start")
+	if stayAt < 0 || startAt < 0 || stayAt > startAt {
+		t.Fatal("oauth-start is not after the finished-login check")
+	}
+	if !strings.Contains(clickBody[stayAt:startAt], "return;") {
+		t.Fatal("a finished login still reaches oauth-start")
 	}
 	if strings.Contains(script, "innerHTML") {
 		t.Fatal("page script assigns innerHTML")

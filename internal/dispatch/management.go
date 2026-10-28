@@ -1024,21 +1024,21 @@ async function refreshSaved(){
   const state = loginState;
   const gen = pollGen;
   const snapshot = await fetchStatus(state);
-  if (!snapshot || snapshot.error || gen !== pollGen || state !== loginState) return 'stale';
+  if (!snapshot || snapshot.error || gen !== pollGen || state !== loginState) return {phase: 'stale'};
   if (snapshot.status === 403) {
     rememberKey(keyBox.value.replace(/[\r\n]/g, '').trim(), false);
     result.textContent = resultMessage(snapshot.status, snapshot.text);
-    return 'stale';
+    return {phase: 'stale'};
   }
   const phase = phaseOf(snapshot.data);
-  if (phase === 'stale') return 'stale';
+  if (phase === 'stale') return {phase: 'stale', status: snapshot.status, text: snapshot.text};
   loginPhase = phase;
   if (phase === 'pending') {
     if (!urlBox.value.trim()) result.textContent = resultMessage(snapshot.status, snapshot.text);
-    return 'pending';
+    return {phase: 'pending', data: snapshot.data};
   }
   showStatus(snapshot.data, snapshot.status, snapshot.text);
-  return 'terminal';
+  return {phase: 'terminal', data: snapshot.data};
 }
 async function pollOnce(){
   if (!loginState) return;
@@ -1071,8 +1071,8 @@ async function pollOnce(){
 }
 function resumeLogin(){
   const gen = pollGen;
-  refreshSaved().then(function (phase) {
-    if (gen !== pollGen || phase !== 'pending' || !loginState) return;
+  refreshSaved().then(function (saved) {
+    if (gen !== pollGen || !saved || saved.phase !== 'pending' || !loginState) return;
     if (!pollTimer) pollTimer = setTimeout(pollOnce, 1000);
   });
 }
@@ -1109,6 +1109,20 @@ function showContinue(url){
   link.textContent = '继续华为授权';
   box.appendChild(link);
 }
+function finishedLogin(data){
+  return !!(data && (data.done === true || data.bound === true));
+}
+function statusFailure(status, text){
+  let detail = '';
+  try {
+    const data = JSON.parse(text || '');
+    if (typeof data.message === 'string' && data.message) detail = data.message;
+    else if (typeof data.error === 'string' && data.error) detail = data.error;
+  } catch (e) {}
+  if (detail) return '没能查询这次登录的状态。' + detail;
+  if (status) return '没能查询这次登录的状态（' + status + '）。请再点一次。';
+  return '没能查询这次登录的状态。请再点一次。';
+}
 keyBox.value = savedKey();
 loginState = savedLoginState();
 loginButton.addEventListener('click', async function () {
@@ -1119,18 +1133,27 @@ loginButton.addEventListener('click', async function () {
     result.textContent = '先填写管理密钥。它和登录 CPAMP 时相同。';
     return;
   }
+  const popup = window.open('', '_blank');
   loginButton.disabled = true;
   try {
     if (loginState && loginPhase !== 'terminal') {
-      const phase = await refreshSaved();
-      if (phase === 'pending') {
+      const saved = await refreshSaved();
+      if (saved.phase === 'pending') {
+        if (popup) popup.close();
         result.textContent = '登录仍在进行。留着这一页即可。';
         if (!pollTimer) pollTimer = setTimeout(pollOnce, 1000);
         return;
       }
-      if (phase !== 'terminal') return;
+      if (saved.phase === 'terminal' && finishedLogin(saved.data)) {
+        if (popup) popup.close();
+        return;
+      }
+      if (saved.phase !== 'terminal') {
+        if (popup) popup.close();
+        if (!result.textContent) result.textContent = statusFailure(saved.status, saved.text);
+        return;
+      }
     }
-    const popup = window.open('', '_blank');
     stopPoll();
     pollGen++;
     try {

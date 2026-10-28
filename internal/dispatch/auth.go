@@ -210,10 +210,18 @@ func handleLoginPoll(request []byte) ([]byte, error) {
 			Auth:    out.Auth,
 		})
 	}
-	if out.Rejected {
+	// Ticket GET races an in-flight authorization_code exchange. A burned
+	// code stays on the rejection text; it must not look uncaptured.
+	if out.Busy {
 		return okEnvelope(pluginapi.AuthLoginPollResponse{
 			Status:  pluginapi.AuthLoginStatusPending,
-			Message: "authorization code rejected: " + out.RejectReason + "; paste a new callback URL or reset login",
+			Message: "exchanging authorization code",
+		})
+	}
+	if out.Rejected || out.PriorFailure {
+		return okEnvelope(pluginapi.AuthLoginPollResponse{
+			Status:  pluginapi.AuthLoginStatusPending,
+			Message: rejectedPollMessage(out.RejectReason),
 		})
 	}
 
@@ -541,6 +549,14 @@ func exchangeCode(callbackID string, lc protocol.LoginConfig, sess *loginSession
 		return protocol.TokenResponse{}, fmt.Errorf("token response missing DPoP-bound refresh_token")
 	}
 	return tok, nil
+}
+
+func rejectedPollMessage(reason string) string {
+	const tail = "; paste a new callback URL or reset login"
+	if reason == "" {
+		return "authorization code rejected" + tail
+	}
+	return "authorization code rejected: " + reason + tail
 }
 
 func pollTicket(callbackID string, lc protocol.LoginConfig, sess *loginSession, capturedSecret string) (protocol.TokenResponse, error) {
