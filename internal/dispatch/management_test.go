@@ -71,7 +71,9 @@ func TestManagementPageDoesNotCaptureQuery(t *testing.T) {
 		"loginPhase !== 'terminal'",
 		"登录仍在进行",
 		"function finishedLogin(",
-		"data.done === true || data.bound === true",
+		"return !!(data && data.done === true);",
+		"function forgetLogin()",
+		"if (noLogin(snapshot.data)) forgetLogin();",
 		"没能查询这次登录的状态",
 		"popup.close()",
 		"saved.phase === 'terminal'",
@@ -658,7 +660,8 @@ func TestManagementSubmitDuringPollExchangesOnce(t *testing.T) {
 		t.Fatal("token request did not arrive")
 	}
 	status, result, _ := submitCallback(t, pasted)
-	if status != http.StatusOK || result.Stored || !strings.Contains(result.Message, "不会再次换票") {
+	// The poll still holds the code inside exchangeCode, so the page keeps polling.
+	if status != http.StatusOK || result.Stored || !result.Pending || result.Done || !strings.Contains(result.Message, "正在换票") {
 		t.Fatalf("overlap submit status=%d result=%+v", status, result)
 	}
 	unlock()

@@ -382,6 +382,32 @@ func TestPasteRejectionStaysPendingWhenNewerCodeArrived(t *testing.T) {
 	}
 }
 
+func TestPasteOfRejectedCodeKeepsRejection(t *testing.T) {
+	var hits int
+	beginPollPaste(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, protocol.EpOAuthTokens) {
+			http.NotFound(w, r)
+			return
+		}
+		hits++
+		http.Error(w, "reject", http.StatusBadRequest)
+	}))
+	started := startPageLogin(t)
+	if captureCallback("burned-code", "", started.State, "") == nil {
+		t.Fatal("capture failed")
+	}
+	if first := loginStatus(started.State, ""); first.Pending || !strings.Contains(first.Message, "授权码被拒绝") {
+		t.Fatalf("first=%+v", first)
+	}
+	status, result, _ := submitCallback(t, "http://127.0.0.1:18080/oauth/callback?code=burned-code&state=huawei-x")
+	if status != http.StatusOK || result.Pending || result.Done || !strings.Contains(result.Message, "授权码被拒绝") {
+		t.Fatalf("status=%d result=%+v", status, result)
+	}
+	if strings.Contains(result.Message, "不会再次换票") || hits != 1 {
+		t.Fatalf("result=%+v hits=%d", result, hits)
+	}
+}
+
 func TestOverlappingRedeemKeepsTheOtherBusy(t *testing.T) {
 	gate := newExchangeGate("old-code", "new-code")
 	t.Cleanup(gate.releaseAll)

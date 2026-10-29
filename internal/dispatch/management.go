@@ -534,6 +534,14 @@ func bindPastedCallbackResult(parts protocol.CallbackParts, callbackID string) b
 			return exchangeBoundCode(sess, callbackID)
 		}
 		if claimed {
+			// The code is already with another redeem. Keep the page polling
+			// while it is in flight, and report a rejection that already happened.
+			if sessionBusy(sess) {
+				return exchangingOutcome()
+			}
+			if sessionExchangeFailed(sess) {
+				return rejectedLoginOutcome(sess.ID, false)
+			}
 			return bindOutcome{
 				Status: http.StatusOK,
 				managementResult: managementResult{
@@ -982,7 +990,10 @@ function showStatus(data, status, text){
     return;
   }
   if (data) loginPhase = 'terminal';
-  if (data && data.done) stopPoll();
+  if (data && data.done === true) {
+    stopPoll();
+    forgetLogin();
+  }
 }
 async function fetchStatus(state){
   const gen = pollGen;
@@ -1038,6 +1049,7 @@ async function refreshSaved(){
     return {phase: 'pending', data: snapshot.data};
   }
   showStatus(snapshot.data, snapshot.status, snapshot.text);
+  if (noLogin(snapshot.data)) forgetLogin();
   return {phase: 'terminal', data: snapshot.data};
 }
 async function pollOnce(){
@@ -1068,6 +1080,7 @@ async function pollOnce(){
   }
   if (gen !== pollGen || state !== loginState) return;
   showStatus(snapshot.data, snapshot.status, snapshot.text);
+  if (noLogin(snapshot.data)) forgetLogin();
 }
 function resumeLogin(){
   const gen = pollGen;
@@ -1110,7 +1123,14 @@ function showContinue(url){
   box.appendChild(link);
 }
 function finishedLogin(data){
-  return !!(data && (data.done === true || data.bound === true));
+  return !!(data && data.done === true);
+}
+function noLogin(data){
+  return !!(data && typeof data === 'object' && data.pending !== true && data.done !== true && data.bound !== true);
+}
+function forgetLogin(){
+  loginState = '';
+  rememberLoginState('');
 }
 function statusFailure(status, text){
   let detail = '';
@@ -1207,6 +1227,8 @@ form.addEventListener('submit', async function (ev) {
     return;
   }
   button.disabled = true;
+  stopPoll();
+  pollGen++;
   try {
     const resp = await fetch(postURL(), {
       method: 'POST',
@@ -1223,8 +1245,10 @@ form.addEventListener('submit', async function (ev) {
     showStatus(data, resp.status, text);
     if (!keepURL(data)) urlBox.value = '';
     rememberKey(key, resp.status !== 403);
+    if (loginState && loginPhase !== 'terminal' && !pollTimer) pollTimer = setTimeout(pollOnce, 1000);
   } catch (e) {
     result.textContent = '提交没有送到 CPA。确认这个页面是从 CPA 打开的。';
+    if (loginState && loginPhase !== 'terminal' && !pollTimer) pollTimer = setTimeout(pollOnce, 1000);
   } finally {
     button.disabled = false;
   }
