@@ -39,9 +39,7 @@ func keepSession(t *testing.T, id string) func() {
 func resetForTest(t *testing.T) {
 	t.Helper()
 	t.Cleanup(func() {
-		sessMu.Lock()
-		sessions = map[string]*loginSession{}
-		sessMu.Unlock()
+		clearLoginState()
 		clearResourceBase()
 		SetEndpoints(endpointOverride{})
 		SetCaller(nil)
@@ -49,9 +47,7 @@ func resetForTest(t *testing.T) {
 		setConfig(defaultConfig())
 		stopCallbackListener()
 	})
-	sessMu.Lock()
-	sessions = map[string]*loginSession{}
-	sessMu.Unlock()
+	clearLoginState()
 	clearResourceBase()
 	SetEndpoints(endpointOverride{})
 	SetCaller(nil)
@@ -957,6 +953,12 @@ func TestLoginStartReplacesPreviousSession(t *testing.T) {
 	if strings.Contains(body, "未绑定到进行中的登录") || strings.Contains(body, huaweiState) {
 		t.Fatalf("callback page:\n%s", body)
 	}
+	if !strings.Contains(body, "已经打开的「码道登录」") || !strings.Contains(body, "OAuth 卡片") || !strings.Contains(body, "不要再点「登录」") {
+		t.Fatalf("callback page does not separate page and card login:\n%s", body)
+	}
+	if strings.Contains(body, "回到「码道登录」页面即可") {
+		t.Fatalf("callback page still sends every login through the plugin button:\n%s", body)
+	}
 	want := managementCallbackURL(port, huaweiCode, second.State)
 	if !strings.Contains(body, html.EscapeString(want)) {
 		t.Fatalf("page missing %s\n%s", want, body)
@@ -1008,12 +1010,20 @@ func TestManagementRegisterExposesCallbackPageAndAuthenticatedPost(t *testing.T)
 	if page.Menu != managementMenuName || page.Path != resourceCallbackRoute || page.Description == "" {
 		t.Fatalf("resource = %+v", page)
 	}
-	if len(reg.Routes) != 1 {
+	if len(reg.Routes) != 3 {
 		t.Fatalf("routes = %+v", reg.Routes)
 	}
-	post := reg.Routes[0]
-	if post.Method != http.MethodPost || post.Path != managementCallbackRoute || post.Menu != "" {
-		t.Fatalf("post route = %+v", post)
+	got := map[string]managementRouteJSON{}
+	for _, route := range reg.Routes {
+		got[route.Path] = route
+		if route.Method != http.MethodPost || route.Menu != "" || route.Description == "" {
+			t.Fatalf("route = %+v", route)
+		}
+	}
+	for _, path := range []string{managementLoginRoute, managementCallbackRoute, managementStatusRoute} {
+		if _, ok := got[path]; !ok {
+			t.Fatalf("missing %s in %+v", path, reg.Routes)
+		}
 	}
 	status, result, _ := callManagement(t, pluginapi.ManagementRequest{Method: http.MethodGet, Path: "/oauth"})
 	if status != http.StatusNotFound || result.Message == "" {

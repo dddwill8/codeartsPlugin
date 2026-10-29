@@ -52,6 +52,12 @@ func handleExecute(request []byte, streamRPC bool) ([]byte, error) {
 		payload = jsonBytes(request, "Payload", "payload", "OriginalRequest", "original_request")
 	}
 	stream := streamRPC || req.Stream || jsonBool(request, "Stream", "stream")
+	if model == "" {
+		model = jsonString(payload, "model")
+	}
+	// Huawei only knows the bare id (GLM-5.3). A CPA route name such as
+	// codearts/GLM-5.3 can reach here in req.Model or in the payload.
+	model = protocol.StripModelPrefix(model, authPrefix(req.AuthMetadata, req.AuthAttributes, raw), protocol.AccountKey(cred))
 	body, model, err := protocol.PrepareChatBody(payload, model, stream)
 	if err != nil {
 		return errorEnvelope("executor_error", err.Error(), http.StatusBadRequest), nil
@@ -102,6 +108,19 @@ func handleExecute(request []byte, streamRPC bool) ([]byte, error) {
 	})
 }
 
+// authPrefix is the CPA model prefix configured for this auth. CPA reads it
+// from the auth file's "prefix" key, and the same key comes back in the
+// executor's AuthMetadata and in StorageJSON.
+func authPrefix(meta map[string]any, attrs map[string]string, storage []byte) string {
+	if p, ok := meta["prefix"].(string); ok && strings.TrimSpace(p) != "" {
+		return p
+	}
+	if p := strings.TrimSpace(attrs["prefix"]); p != "" {
+		return p
+	}
+	return jsonString(storage, "prefix")
+}
+
 func routeMissed(body []byte) bool {
 	s := string(body)
 	return strings.Contains(s, "InferHub.002002009") || strings.Contains(s, "Route missed") || strings.Contains(s, "not registered")
@@ -132,6 +151,16 @@ func executeStream(callbackID, pluginStreamID string, httpReq *http.Request, ret
 		}
 	}
 	if status >= 400 {
+		// The host keeps an opened stream until it is closed. Read the error
+		// body if do_stream returned none, then release the stream.
+		if hostStreamID != "" {
+			if len(buffered) == 0 {
+				if payload, _, _ := hostHTTPStreamRead(hostStreamID); len(payload) > 0 {
+					buffered = payload
+				}
+			}
+			hostHTTPStreamClose(hostStreamID)
+		}
 		return errorEnvelope("upstream_error", fmt.Sprintf("chat stream http=%d %s", status, truncate(string(buffered), 300)), status), nil
 	}
 	if headers == nil {

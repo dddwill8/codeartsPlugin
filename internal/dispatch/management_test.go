@@ -33,7 +33,7 @@ func TestManagementPageDoesNotCaptureQuery(t *testing.T) {
 		t.Fatalf("status=%d", status)
 	}
 	htmlBody := string(body)
-	for _, want := range []string{managementMenuName, "等待插件认证中", "地址栏里的完整 URL", "不要把这条 URL 贴进 CPA 的 OAuth 回调框", "http://127.0.0.1:18080/oauth/callback"} {
+	for _, want := range []string{managementMenuName, "登录", "地址栏里的完整 URL", "不要把这条 URL 贴进 CPA 的 OAuth 回调框", "不需要打开 CPAMP", "http://127.0.0.1:18080/oauth/callback", "刷新后会接着查同一次登录", "window.open", "login_state"} {
 		if !strings.Contains(htmlBody, want) {
 			t.Fatalf("page missing %s", want)
 		}
@@ -56,13 +56,68 @@ func TestManagementPageDoesNotCaptureQuery(t *testing.T) {
 		"noopener noreferrer",
 		"createElement('a')",
 		"link.textContent",
+		"let pollGen = 0",
+		"pollAbort.abort()",
+		"gen !== pollGen",
+		"state !== loginState",
+		"new AbortController()",
+		"signal: abort.signal",
+		"pollGen++",
+		"codearts.loginState",
+		"function savedLoginState()",
+		"function rememberLoginState(",
+		"function resumeLogin()",
+		"if (loginState) resumeLogin();",
+		"loginPhase !== 'terminal'",
+		"登录仍在进行",
+		"function finishedLogin(",
+		"return !!(data && data.done === true);",
+		"function forgetLogin()",
+		"if (noLogin(snapshot.data)) forgetLogin();",
+		"没能查询这次登录的状态",
+		"popup.close()",
+		"saved.phase === 'terminal'",
+		"saved.phase === 'pending'",
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("page script missing %s", want)
 		}
 	}
+	resumeAt := strings.Index(script, "function resumeLogin()")
+	clickAt := strings.Index(script, "loginButton.addEventListener")
+	if resumeAt < 0 || clickAt < resumeAt {
+		t.Fatal("resumeLogin is not defined before the login button")
+	}
+	resumeBody := script[resumeAt:clickAt]
+	if strings.Contains(resumeBody, "cfg.start") {
+		t.Fatal("resumeLogin starts a new session")
+	}
+	if !strings.Contains(resumeBody, "refreshSaved") {
+		t.Fatal("resumeLogin does not query the saved session")
+	}
+	formAt := strings.Index(script, "form.addEventListener")
+	if clickAt < 0 || formAt < clickAt {
+		t.Fatal("login click handler is missing")
+	}
+	clickBody := script[clickAt:formAt]
+	openAt := strings.Index(clickBody, "window.open")
+	awaitAt := strings.Index(clickBody, "await ")
+	if openAt < 0 || awaitAt < 0 || openAt > awaitAt {
+		t.Fatal("window.open runs after an await")
+	}
+	stayAt := strings.Index(clickBody, "finishedLogin")
+	startAt := strings.Index(clickBody, "cfg.start")
+	if stayAt < 0 || startAt < 0 || stayAt > startAt {
+		t.Fatal("oauth-start is not after the finished-login check")
+	}
+	if !strings.Contains(clickBody[stayAt:startAt], "return;") {
+		t.Fatal("a finished login still reaches oauth-start")
+	}
 	if strings.Contains(script, "innerHTML") {
 		t.Fatal("page script assigns innerHTML")
+	}
+	if strings.Contains(htmlBody, "等待插件认证中") {
+		t.Fatal("page still requires the CPAMP card")
 	}
 	code, secret, ok := capturedOf(t, start.State)
 	if !ok || code != "" || secret != "" {
@@ -202,41 +257,40 @@ func TestManagementPostBindsHuaweiStateThenPollExchangesOnce(t *testing.T) {
 	t.Cleanup(func() { log.SetOutput(os.Stderr) })
 
 	status, result, body := submitCallback(t, rawURL)
-	if status != http.StatusOK || !result.Stored || !result.Bound || result.Pending {
+	if status != http.StatusOK || !result.Stored || !result.Bound || !result.Done || result.Pending {
 		t.Fatalf("status=%d result=%+v", status, result)
 	}
-	if !strings.Contains(result.Message, "已交给进行中的登录") || !strings.Contains(result.Message, "等待插件认证中") {
+	if !strings.Contains(result.Message, "登录完成") || strings.Contains(result.Message, "等待插件认证中") {
 		t.Fatalf("message=%q", result.Message)
 	}
 	if result.ContinueURL != "" {
 		t.Fatalf("code submit returned a continue link: %q", result.ContinueURL)
 	}
-	if strings.Contains(string(body), code) || strings.Contains(logs.String(), code) || strings.Contains(logs.String(), "huawei-minted-state") {
+	if strings.Contains(string(body), code) || strings.Contains(string(body), "rt-paste") || strings.Contains(logs.String(), code) || strings.Contains(logs.String(), "huawei-minted-state") || strings.Contains(logs.String(), "rt-paste") {
 		t.Fatalf("response or log leaked the callback\nbody=%s\nlog=%s", body, logs.String())
 	}
-	if stub.tokenHits != 0 {
-		t.Fatalf("management submit exchanged the code, hits=%d", stub.tokenHits)
+	if stub.tokenHits != 1 || !strings.Contains(stub.tokenBody, code) {
+		t.Fatalf("token hits=%d body=%s", stub.tokenHits, stub.tokenBody)
 	}
-	got, _, ok := capturedOf(t, start.State)
-	if !ok || got != code {
-		t.Fatalf("captured=%q ok=%v", got, ok)
+	if _, _, ok := capturedOf(t, start.State); ok {
+		t.Fatal("session remained after exchange")
 	}
 
 	againStatus, again, _ := submitCallback(t, rawURL)
-	if againStatus != http.StatusOK || !again.Stored {
+	if againStatus != http.StatusConflict || again.Stored || again.Bound {
 		t.Fatalf("second submit status=%d result=%+v", againStatus, again)
 	}
-	if stub.tokenHits != 0 {
+	if stub.tokenHits != 1 {
 		t.Fatalf("second submit exchanged the code, hits=%d", stub.tokenHits)
 	}
 
 	pollReq, _ := json.Marshal(map[string]any{"State": start.State})
 	resp := pollLogin(t, pollReq)
-	if resp.Status != pluginapi.AuthLoginStatusSuccess {
+	if resp.Status != pluginapi.AuthLoginStatusError {
 		t.Fatalf("poll status=%q message=%q", resp.Status, resp.Message)
 	}
-	if stub.tokenHits != 1 || !strings.Contains(stub.tokenBody, code) {
-		t.Fatalf("token hits=%d body=%s", stub.tokenHits, stub.tokenBody)
+	if stub.tokenHits != 1 {
+		t.Fatalf("poll exchanged again, hits=%d body=%s", stub.tokenHits, stub.tokenBody)
 	}
 
 	thirdStatus, third, _ := submitCallback(t, rawURL)
@@ -309,15 +363,17 @@ func TestManagementPostAcceptsFormRawAndQuery(t *testing.T) {
 				req.Headers = managementHeaders("test-mgmt")
 			}
 			status, result, body := callManagement(t, req)
-			if status != http.StatusOK || !result.Stored {
+			if status != http.StatusOK || !result.Stored || !result.Done {
 				t.Fatalf("status=%d result=%+v body=%s", status, result, body)
 			}
-			if stub.tokenHits != 0 {
-				t.Fatalf("token hits=%d", stub.tokenHits)
+			if stub.tokenHits != 1 || !strings.HasSuffix(stub.code, "-code") {
+				t.Fatalf("token hits=%d code=%q", stub.tokenHits, stub.code)
 			}
-			code, _, ok := capturedOf(t, start.State)
-			if !ok || !strings.HasSuffix(code, "-code") {
-				t.Fatalf("captured=%q ok=%v", code, ok)
+			if strings.Contains(string(body), stub.code) || strings.Contains(string(body), "rt-paste") {
+				t.Fatalf("response leaked the code or refresh token: %s", body)
+			}
+			if _, _, ok := capturedOf(t, start.State); ok {
+				t.Fatal("session remained after exchange")
 			}
 		})
 	}
@@ -437,23 +493,24 @@ func TestManagementPostOmitsUnsafeContinueLink(t *testing.T) {
 
 func TestManagementPostDoesNotFetchPastedURL(t *testing.T) {
 	hits := 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	pastedSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits++
 		http.Error(w, "pasted URL must not be fetched", http.StatusInternalServerError)
 	}))
-	t.Cleanup(srv.Close)
-	resetForTest(t)
-	SetHTTPClient(srv.Client())
-	regReq, _ := json.Marshal(lifecycleRequest{ConfigYAML: []byte("oauth_callback_port: 0\n")})
-	_ = mustResult(t, pluginabi.MethodPluginRegister, regReq)
+	t.Cleanup(pastedSrv.Close)
+	stub := &pollPasteStub{}
+	beginPollPaste(t, stub)
 	_ = startPollPasteLogin(t)
-	pasted := srv.URL + "/oauth/callback?code=ssrf-code&state=huawei"
+	pasted := pastedSrv.URL + "/oauth/callback?code=ssrf-code&state=huawei"
 	status, result, _ := submitCallback(t, pasted)
-	if status != http.StatusOK || !result.Stored {
+	if status != http.StatusOK || !result.Stored || !result.Done {
 		t.Fatalf("status=%d result=%+v", status, result)
 	}
 	if hits != 0 {
 		t.Fatalf("pasted URL was fetched %d times", hits)
+	}
+	if stub.tokenHits != 1 || stub.code != "ssrf-code" {
+		t.Fatalf("token hits=%d code=%q", stub.tokenHits, stub.code)
 	}
 }
 
@@ -472,54 +529,70 @@ func TestManagementPostBindingRules(t *testing.T) {
 		}
 	})
 	t.Run("two sessions foreign state", func(t *testing.T) {
-		resetForTest(t)
-		older, newer := startTwoLogins(t)
+		stub := &pollPasteStub{}
+		beginPollPaste(t, stub)
+		older, newer := startTwoOpenLogins(t)
 		status, result, _ := submitCallback(t, "http://127.0.0.1:18080/oauth/callback?code=foreign&state=neither&ticket_id=neither")
 		if status != http.StatusConflict || result.Bound {
 			t.Fatalf("status=%d result=%+v", status, result)
+		}
+		if stub.tokenHits != 0 {
+			t.Fatalf("token hits=%d", stub.tokenHits)
 		}
 		assertCapturedEmpty(t, older.State)
 		assertCapturedEmpty(t, newer.State)
 	})
 	t.Run("state selects one", func(t *testing.T) {
-		resetForTest(t)
-		older, newer := startTwoLogins(t)
+		stub := &pollPasteStub{}
+		beginPollPaste(t, stub)
+		older, newer := startTwoOpenLogins(t)
+		olderVerifier := verifierOf(t, older.State)
 		status, result, _ := submitCallback(t, "http://127.0.0.1:18080/oauth/callback?code=older-only&state="+url.QueryEscape(older.State))
-		if status != http.StatusOK || !result.Stored {
+		if status != http.StatusOK || !result.Stored || !result.Done {
 			t.Fatalf("status=%d result=%+v", status, result)
 		}
-		code, _, ok := capturedOf(t, older.State)
-		if !ok || code != "older-only" {
-			t.Fatalf("older captured=%q ok=%v", code, ok)
+		if stub.tokenHits != 1 || stub.code != "older-only" || stub.verifier != olderVerifier {
+			t.Fatalf("hits=%d code=%q verifier=%q", stub.tokenHits, stub.code, stub.verifier)
+		}
+		if _, _, ok := capturedOf(t, older.State); ok {
+			t.Fatal("older session remained")
 		}
 		assertCapturedEmpty(t, newer.State)
 	})
 	t.Run("ticket selects one", func(t *testing.T) {
-		resetForTest(t)
-		older, newer := startTwoLogins(t)
+		stub := &pollPasteStub{}
+		beginPollPaste(t, stub)
+		older, newer := startTwoOpenLogins(t)
+		newerVerifier := verifierOf(t, newer.State)
 		ticket := metadataString(t, newer, "ticket_id")
 		status, result, _ := submitCallback(t, "http://127.0.0.1:18080/oauth/callback?code=newer-ticket&state=huawei&ticket_id="+url.QueryEscape(ticket))
-		if status != http.StatusOK || !result.Stored {
+		if status != http.StatusOK || !result.Stored || !result.Done {
 			t.Fatalf("status=%d result=%+v", status, result)
 		}
-		code, _, ok := capturedOf(t, newer.State)
-		if !ok || code != "newer-ticket" {
-			t.Fatalf("newer captured=%q ok=%v", code, ok)
+		if stub.tokenHits != 1 || stub.code != "newer-ticket" || stub.verifier != newerVerifier {
+			t.Fatalf("hits=%d code=%q verifier=%q", stub.tokenHits, stub.code, stub.verifier)
+		}
+		if _, _, ok := capturedOf(t, newer.State); ok {
+			t.Fatal("newer session remained")
 		}
 		assertCapturedEmpty(t, older.State)
 	})
 	t.Run("state wins over another ticket", func(t *testing.T) {
-		resetForTest(t)
-		older, newer := startTwoLogins(t)
+		stub := &pollPasteStub{}
+		beginPollPaste(t, stub)
+		older, newer := startTwoOpenLogins(t)
+		olderVerifier := verifierOf(t, older.State)
 		ticket := metadataString(t, newer, "ticket_id")
 		pasted := "http://127.0.0.1:18080/oauth/callback?code=state-wins&state=" + url.QueryEscape(older.State) + "&ticket_id=" + url.QueryEscape(ticket)
 		status, result, _ := submitCallback(t, pasted)
-		if status != http.StatusOK || !result.Stored {
+		if status != http.StatusOK || !result.Stored || !result.Done {
 			t.Fatalf("status=%d result=%+v", status, result)
 		}
-		code, _, ok := capturedOf(t, older.State)
-		if !ok || code != "state-wins" {
-			t.Fatalf("older captured=%q ok=%v", code, ok)
+		if stub.tokenHits != 1 || stub.code != "state-wins" || stub.verifier != olderVerifier {
+			t.Fatalf("hits=%d code=%q verifier=%q", stub.tokenHits, stub.code, stub.verifier)
+		}
+		if _, _, ok := capturedOf(t, older.State); ok {
+			t.Fatal("older session remained")
 		}
 		assertCapturedEmpty(t, newer.State)
 	})
@@ -566,8 +639,8 @@ func TestManagementSubmitDuringPollExchangesOnce(t *testing.T) {
 	_ = mustResult(t, pluginabi.MethodPluginRegister, regReq)
 	start := startPollPasteLogin(t)
 	pasted := "http://127.0.0.1:18080/oauth/callback?code=" + code + "&state=huawei-race"
-	if status, result, _ := submitCallback(t, pasted); status != http.StatusOK || !result.Stored {
-		t.Fatalf("status=%d result=%+v", status, result)
+	if captureCallback(code, "", start.State, "") == nil {
+		t.Fatal("listener did not capture the code")
 	}
 	pollReq, _ := json.Marshal(map[string]any{"State": start.State})
 	type pollAsync struct {
@@ -587,7 +660,8 @@ func TestManagementSubmitDuringPollExchangesOnce(t *testing.T) {
 		t.Fatal("token request did not arrive")
 	}
 	status, result, _ := submitCallback(t, pasted)
-	if status != http.StatusOK || result.Stored || !strings.Contains(result.Message, "不会再次换票") {
+	// The poll still holds the code inside exchangeCode, so the page keeps polling.
+	if status != http.StatusOK || result.Stored || !result.Pending || result.Done || !strings.Contains(result.Message, "正在换票") {
 		t.Fatalf("overlap submit status=%d result=%+v", status, result)
 	}
 	unlock()
@@ -612,11 +686,10 @@ func TestManagementSubmitDuringPollExchangesOnce(t *testing.T) {
 func TestManagementPostKeepsTheFirstUnclaimedCode(t *testing.T) {
 	resetForTest(t)
 	start := startBareLogin(t)
-	status, result, _ := submitCallback(t, "http://127.0.0.1:18080/oauth/callback?code=first-code&state=huawei")
-	if status != http.StatusOK || !result.Stored {
-		t.Fatalf("status=%d result=%+v", status, result)
+	if captureCallback("first-code", "", start.State, "") == nil {
+		t.Fatal("capture failed")
 	}
-	status, result, _ = submitCallback(t, "http://127.0.0.1:18080/oauth/callback?code=second-code&state=huawei")
+	status, result, _ := submitCallback(t, "http://127.0.0.1:18080/oauth/callback?code=second-code&state=huawei")
 	if status != http.StatusConflict || result.Stored || !strings.Contains(result.Message, "另一条授权码") {
 		t.Fatalf("status=%d result=%+v", status, result)
 	}
@@ -690,6 +763,11 @@ func startTwoLogins(t *testing.T) (older, newer pluginapi.AuthLoginStartResponse
 	t.Helper()
 	regReq, _ := json.Marshal(lifecycleRequest{ConfigYAML: []byte("oauth_callback_port: 0\n")})
 	_ = mustResult(t, pluginabi.MethodPluginRegister, regReq)
+	return startTwoOpenLogins(t)
+}
+
+func startTwoOpenLogins(t *testing.T) (older, newer pluginapi.AuthLoginStartResponse) {
+	t.Helper()
 	older = startPollPasteLogin(t)
 	restore := keepSession(t, older.State)
 	newer = startPollPasteLogin(t)

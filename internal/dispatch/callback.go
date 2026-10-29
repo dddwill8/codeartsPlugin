@@ -111,9 +111,13 @@ func managementCallbackURL(port int, code, state string) string {
 
 // oauthCallbackPage tells the user what to do with this hop.
 // A bound callback that already has a code shows one URL whose state is the
-// login session id. A first hop (secret or portal redirect, no code) records
-// that locally and does not offer a URL CPA would accept. An unmatched
-// callback does not claim the code was received and does not show a URL.
+// login session id. A login started on the already-open plugin page finishes
+// when that page polls. A login started on the CPA card finishes by leaving
+// the card polling. Neither path should send the user through the plugin
+// page's login button, which replaces the session. A first hop (secret or
+// portal redirect, no code) records that locally and does not offer a URL CPA
+// would accept. An unmatched callback does not claim the code was received
+// and does not show a URL.
 func oauthCallbackPage(bound *loginSession, code, secret, redirect string) string {
 	safe := protocol.SafePortalRedirect(redirect)
 	var b strings.Builder
@@ -135,7 +139,7 @@ func oauthCallbackPage(bound *loginSession, code, secret, redirect string) strin
 	if code != "" && bound != nil {
 		paste := managementCallbackURL(bound.Port, code, bound.ID)
 		b.WriteString(`<h3>已接收授权码。</h3>`)
-		b.WriteString(`<p>把下面这一条粘贴到 CPA 管理界面的 OAuth 登录。不要粘贴浏览器地址栏里的原文。</p>`)
+		b.WriteString(`<p>如果这次登录是在已经打开的「码道登录」页面开始的，留着那一页，状态查询会完成登录。如果这次登录是在 CPA 的 OAuth 卡片上开始的，留着卡片继续轮询。不要再点「登录」，那会换掉这次会话。下面这一条只在需要手工提交时使用。不要粘贴浏览器地址栏里的原文。</p>`)
 		b.WriteString(`<p><code>` + html.EscapeString(paste) + `</code></p>`)
 		b.WriteString(`</body></html>`)
 		return b.String()

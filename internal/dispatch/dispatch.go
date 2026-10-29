@@ -106,7 +106,7 @@ func pluginRegistration() registration {
 			Name:             protocol.PluginID,
 			Version:          protocol.PluginVersion,
 			Author:           protocol.PluginAuthor,
-			GitHubRepository: "https://github.com/HITZY2002/codearts2api",
+			GitHubRepository: "https://github.com/dddwill8/codeartsPlugin",
 			ConfigFields:     configFields(),
 		},
 		Capabilities: registrationCapabilities{

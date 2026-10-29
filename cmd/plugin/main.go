@@ -56,6 +56,7 @@ static void free_host_buffer(void* ptr, size_t len) {
 import "C"
 
 import (
+	"encoding/json"
 	"fmt"
 	"unsafe"
 
@@ -161,5 +162,12 @@ func writeResponse(response *C.cliproxy_buffer, raw []byte) {
 }
 
 func mustError(code, message string) []byte {
-	return []byte(`{"ok":false,"error":{"code":"` + code + `","message":"` + message + `"}}`)
+	raw, err := json.Marshal(map[string]any{
+		"ok":    false,
+		"error": map[string]string{"code": code, "message": message},
+	})
+	if err != nil {
+		return []byte(`{"ok":false,"error":{"code":"plugin_error","message":"error envelope encoding failed"}}`)
+	}
+	return raw
 }

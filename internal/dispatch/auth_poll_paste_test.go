@@ -310,6 +310,81 @@ func assertAuthDirExchanges(t *testing.T, reqFor func(state, dir string) map[str
 	}
 }
 
+func TestPollPriorFailureDoesNotQueryTicket(t *testing.T) {
+	var ticketHits int
+	var tokenHits int
+	beginPollPaste(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, protocol.EpLoginTicket) {
+			ticketHits++
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"user_id":"","refresh_token":"","credentials":{}}`))
+			return
+		}
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, protocol.EpOAuthTokens) {
+			tokenHits++
+			http.Error(w, "reject", http.StatusBadRequest)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	started := startPollPasteLogin(t)
+	if captureCallback("burned-code", "", started.State, "") == nil {
+		t.Fatal("capture failed")
+	}
+	req := mustJSON(t, map[string]any{"State": started.State})
+	first := pollLogin(t, req)
+	if first.Status != pluginapi.AuthLoginStatusPending || !strings.Contains(first.Message, "authorization code rejected") {
+		t.Fatalf("first status=%q message=%q", first.Status, first.Message)
+	}
+	if tokenHits != 1 || ticketHits != 0 {
+		t.Fatalf("after reject token=%d ticket=%d", tokenHits, ticketHits)
+	}
+	second := pollLogin(t, req)
+	if second.Status != pluginapi.AuthLoginStatusPending || !strings.Contains(second.Message, "authorization code rejected") {
+		t.Fatalf("second status=%q message=%q", second.Status, second.Message)
+	}
+	if strings.Contains(second.Message, "waiting for Huawei authorization code") {
+		t.Fatalf("second message=%q", second.Message)
+	}
+	if tokenHits != 1 || ticketHits != 0 {
+		t.Fatalf("follow-up token=%d ticket=%d", tokenHits, ticketHits)
+	}
+}
+
+func TestPollBusyDoesNotQueryTicket(t *testing.T) {
+	var ticketHits int
+	beginPollPaste(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, protocol.EpLoginTicket) {
+			ticketHits++
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"user_id":"","refresh_token":"","credentials":{}}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	started := startPollPasteLogin(t)
+	sess := getSession(started.State)
+	if sess == nil {
+		t.Fatal("missing session")
+	}
+	sessMu.Lock()
+	sess.exchanging = 1
+	sess.exchangeFailed = true
+	sess.CapturedCode = ""
+	sessMu.Unlock()
+
+	resp := pollLogin(t, mustJSON(t, map[string]any{"State": started.State}))
+	if resp.Status != pluginapi.AuthLoginStatusPending || !strings.Contains(resp.Message, "exchanging authorization code") {
+		t.Fatalf("status=%q message=%q", resp.Status, resp.Message)
+	}
+	if strings.Contains(resp.Message, "waiting for Huawei authorization code") || strings.Contains(resp.Message, "authorization code rejected") {
+		t.Fatalf("message=%q", resp.Message)
+	}
+	if ticketHits != 0 {
+		t.Fatalf("ticket hits=%d", ticketHits)
+	}
+}
+
 func beginPollPaste(t *testing.T, h http.Handler) {
 	t.Helper()
 	resetForTest(t)

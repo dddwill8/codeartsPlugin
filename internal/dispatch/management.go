@@ -16,10 +16,21 @@ import (
 )
 
 const (
+	// managementLoginRoute starts one plugin-page login. The state it returns
+	// stays in the plugin and is not registered in CPA's OAuth session table.
+	managementLoginRoute = "/codearts/oauth-start"
+	managementLoginFull  = "/v0/management" + managementLoginRoute
+
 	// managementCallbackRoute is the authenticated POST that accepts one pasted
-	// loopback URL. It is not a browser resource: resource requests are public.
+	// loopback URL and exchanges it. It is not a browser resource: resource
+	// requests are public.
 	managementCallbackRoute = "/codearts/oauth-callback"
 	managementCallbackFull  = "/v0/management" + managementCallbackRoute
+
+	// managementStatusRoute polls the plugin-page session. The loopback listener
+	// only captures; this route exchanges when a code is already stored.
+	managementStatusRoute = "/codearts/oauth-status"
+	managementStatusFull  = "/v0/management" + managementStatusRoute
 
 	// resourceCallbackRoute is the CPAMP plugin-menu page. GET only.
 	// CPA prefixes it with ResourceBasePath, which is
@@ -32,7 +43,7 @@ const (
 	// rejected before they can be stored on a session.
 	maxCallbackPaste = 64 << 10
 
-	managementMenuName = "提交华为回调"
+	managementMenuName = "码道登录"
 )
 
 var errCallbackTooLarge = errors.New("callback paste too large")
@@ -76,6 +87,10 @@ type managementResult struct {
 	Pending     bool   `json:"pending"`
 	Message     string `json:"message"`
 	ContinueURL string `json:"continue_url,omitempty"`
+	AuthURL     string `json:"auth_url,omitempty"`
+	State       string `json:"state,omitempty"`
+	Label       string `json:"label,omitempty"`
+	Done        bool   `json:"done,omitempty"`
 }
 
 func handleManagementRegister(request []byte) ([]byte, error) {
@@ -127,15 +142,27 @@ func cleanResourceBase(raw string) string {
 
 func managementRegistration() managementRegistrationJSON {
 	return managementRegistrationJSON{
-		Routes: []managementRouteJSON{{
-			Method:      http.MethodPost,
-			Path:        managementCallbackRoute,
-			Description: "接收地址栏里的华为回调 URL。需要 CPA 管理认证。",
-		}},
+		Routes: []managementRouteJSON{
+			{
+				Method:      http.MethodPost,
+				Path:        managementLoginRoute,
+				Description: "开始码道登录。需要 CPA 管理认证。",
+			},
+			{
+				Method:      http.MethodPost,
+				Path:        managementCallbackRoute,
+				Description: "接收地址栏里的华为回调 URL，并完成换票。需要 CPA 管理认证。",
+			},
+			{
+				Method:      http.MethodPost,
+				Path:        managementStatusRoute,
+				Description: "查询本次登录状态。需要 CPA 管理认证。",
+			},
+		},
 		Resources: []resourceRouteJSON{{
 			Path:        resourceCallbackRoute,
 			Menu:        managementMenuName,
-			Description: "Chrome 无法连接本机回调时，把地址栏里的完整 URL 交到这里。",
+			Description: "在这一页登录码道。远程时把地址栏里的完整回调 URL 交到这里。",
 		}},
 	}
 }
@@ -148,6 +175,9 @@ func handleManagement(request []byte) ([]byte, error) {
 	if len(request) == 0 || json.Unmarshal(request, &req) != nil {
 		return errorEnvelope("invalid_management_request", "management request is not JSON", http.StatusBadRequest), nil
 	}
+	// host_callback_id is a sibling of the management request, same as auth.login.poll.
+	// An empty id keeps hostHTTPDo on its direct dial.
+	callbackID := jsonString(request, "host_callback_id", "HostCallbackID")
 	method := strings.ToUpper(strings.TrimSpace(req.Method))
 	if method == "" {
 		method = http.MethodGet
@@ -155,8 +185,12 @@ func handleManagement(request []byte) ([]byte, error) {
 	switch {
 	case method == http.MethodGet && isCallbackPagePath(req.Path):
 		return managementBytes(http.StatusOK, "text/html; charset=utf-8", pageCSP(), managementPage())
+	case method == http.MethodPost && samePath(req.Path, managementLoginFull, managementLoginRoute):
+		return startManagementLogin(req)
 	case method == http.MethodPost && samePath(req.Path, managementCallbackFull, managementCallbackRoute):
-		return submitManagementCallback(req)
+		return submitManagementCallback(req, callbackID)
+	case method == http.MethodPost && samePath(req.Path, managementStatusFull, managementStatusRoute):
+		return queryManagementLogin(req, callbackID)
 	case isResourceCallbackPath(req.Path):
 		// The public resource must not accept a code, even as POST with a body.
 		return managementJSON(http.StatusMethodNotAllowed, managementResult{
@@ -218,7 +252,112 @@ func samePath(path, full, rel string) bool {
 	return path == full || path == rel
 }
 
-func submitManagementCallback(req pluginapi.ManagementRequest) ([]byte, error) {
+func startManagementLogin(req pluginapi.ManagementRequest) ([]byte, error) {
+	if !managementAuthorized(req.Headers) {
+		log.Printf("codearts management login http=403")
+		return managementJSON(http.StatusForbidden, managementResult{Message: "需要管理认证。"})
+	}
+	sess, err := beginLoginSession()
+	if err != nil {
+		log.Printf("codearts management login http=500")
+		return managementJSON(http.StatusInternalServerError, managementResult{Message: "登录没有开始。请再点一次。"})
+	}
+	log.Printf("codearts management login http=200")
+	return managementJSON(http.StatusOK, managementResult{
+		OK:      true,
+		AuthURL: sess.AuthURL,
+		State:   sess.ID,
+		Pending: true,
+		Message: "已开始登录。请在打开的页面完成华为授权。",
+	})
+}
+
+func queryManagementLogin(req pluginapi.ManagementRequest, callbackID string) ([]byte, error) {
+	if !managementAuthorized(req.Headers) {
+		log.Printf("codearts management status http=403")
+		return managementJSON(http.StatusForbidden, managementResult{Message: "需要管理认证。"})
+	}
+	state := managementLoginState(req.Body, req.Query)
+	result := loginStatus(state, callbackID)
+	log.Printf("codearts management status http=%d pending=%t done=%t", result.Status, result.Pending, result.Done)
+	return managementJSON(result.Status, result.managementResult)
+}
+
+func loginStatus(state, callbackID string) bindOutcome {
+	if state == "" {
+		return bindOutcome{
+			Status: http.StatusOK,
+			managementResult: managementResult{
+				Message: "没有进行中的登录。请重新点登录。",
+			},
+		}
+	}
+	sess := getSession(state)
+	if sess == nil {
+		if done, ok := doneTerminalOutcome(state); ok {
+			return done
+		}
+		return bindOutcome{
+			Status: http.StatusOK,
+			managementResult: managementResult{
+				Message: "没有进行中的登录。请重新点登录。",
+			},
+		}
+	}
+	out := redeemCaptured(sess, callbackID)
+	if out.Busy {
+		return exchangingOutcome()
+	}
+	if out.SaveFailed {
+		return fileNotWrittenOutcome()
+	}
+	if out.Hard != nil {
+		return bindOutcome{
+			Status: http.StatusBadGateway,
+			managementResult: managementResult{
+				Bound:   true,
+				Message: "换票没有完成。请重新点登录后再授权。",
+			},
+		}
+	}
+	if out.Exchanged {
+		return bindOutcome{
+			Status: http.StatusOK,
+			managementResult: managementResult{
+				OK:      true,
+				Done:    true,
+				Bound:   true,
+				Label:   out.Label,
+				Message: "登录完成。认证文件已写入。",
+			},
+		}
+	}
+	if out.Rejected || out.PriorFailure {
+		return rejectedLoginOutcome(state, false)
+	}
+	if out.Secret != "" {
+		return bindOutcome{
+			Status: http.StatusOK,
+			managementResult: managementResult{
+				OK:      true,
+				Bound:   true,
+				Pending: true,
+				Message: "已记下 secret，登录仍在等待。这是第一跳，没有换票。请继续华为授权。",
+			},
+		}
+	}
+	return bindOutcome{
+		Status: http.StatusOK,
+		managementResult: managementResult{
+			OK:      true,
+			Bound:   true,
+			Pending: true,
+			Message: "等待华为授权。本机回调会自动完成；远程时把地址栏里的完整 URL 贴回这一页。",
+		},
+	}
+}
+
+func submitManagementCallback(req pluginapi.ManagementRequest, callbackID string) ([]byte, error) {
 	if !managementAuthorized(req.Headers) {
 		log.Printf("codearts management callback http=403")
 		return managementJSON(http.StatusForbidden, managementResult{Message: "需要管理认证。"})
@@ -228,8 +367,8 @@ func submitManagementCallback(req pluginapi.ManagementRequest) ([]byte, error) {
 		log.Printf("codearts management callback http=413")
 		return managementJSON(http.StatusRequestEntityTooLarge, managementResult{Message: "回调内容过长。"})
 	}
-	result := bindPastedCallback(protocol.ParseCallback(raw))
-	log.Printf("codearts management callback http=%d bound=%t stored=%t pending=%t", result.Status, result.Bound, result.Stored, result.Pending)
+	result := bindPastedCallback(protocol.ParseCallback(raw), callbackID, pastedLoginState(req.Body))
+	log.Printf("codearts management callback http=%d bound=%t stored=%t pending=%t done=%t", result.Status, result.Bound, result.Stored, result.Pending, result.Done)
 	return managementJSON(result.Status, result.managementResult)
 }
 
@@ -238,13 +377,128 @@ type bindOutcome struct {
 	Status int
 }
 
-// bindPastedCallback stores the paste on one in-flight session and does not
-// exchange it. The next auth.login.poll claims the code once.
-func bindPastedCallback(parts protocol.CallbackParts) bindOutcome {
-	return finishBind(parts, bindPastedCallbackResult(parts))
+// bindPastedCallback stores the paste on one in-flight session. A stored
+// authorization code is exchanged here. A first hop only records the secret.
+// pageState, when set, binds only that session and does not open a new one.
+// An unexpired success for pageState or the callback state returns the same
+// done result as loginStatus and does not capture or exchange. A retired id
+// with no success terminal stays unbound, so a replaced login cannot accept
+// the old code.
+func bindPastedCallback(parts protocol.CallbackParts, callbackID, pageState string) bindOutcome {
+	pageState = strings.TrimSpace(pageState)
+	if done, ok := doneTerminalOutcome(pageState); ok {
+		return done
+	}
+	if done, ok := doneTerminalOutcome(parts.State); ok {
+		return done
+	}
+	if isRetiredSession(parts.State) {
+		return finishBind(parts, unboundLoginResult())
+	}
+	if pageState != "" {
+		if getSession(pageState) == nil || isRetiredSession(pageState) {
+			return finishBind(parts, unboundLoginResult())
+		}
+		if parts.State == "" || getSession(parts.State) == nil {
+			parts.State = pageState
+		}
+	}
+	return finishBind(parts, bindPastedCallbackResult(parts, callbackID))
 }
 
-func bindPastedCallbackResult(parts protocol.CallbackParts) bindOutcome {
+func unboundLoginResult() bindOutcome {
+	return bindOutcome{
+		Status: http.StatusConflict,
+		managementResult: managementResult{
+			Message: "未绑定。没有进行中的登录。请重新点登录。没有写入任何会话。",
+		},
+	}
+}
+
+func doneTerminalOutcome(id string) (bindOutcome, bool) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return bindOutcome{}, false
+	}
+	term, ok := terminalOf(id)
+	if !ok || !term.OK {
+		return bindOutcome{}, false
+	}
+	return bindOutcome{
+		Status: http.StatusOK,
+		managementResult: managementResult{
+			OK:      true,
+			Done:    true,
+			Label:   term.Label,
+			Message: "登录完成。",
+		},
+	}, true
+}
+
+func fileNotWrittenOutcome() bindOutcome {
+	return bindOutcome{
+		Status: http.StatusBadGateway,
+		managementResult: managementResult{
+			Bound:   true,
+			Message: "认证文件没有写入。请重新点登录后再授权。",
+		},
+	}
+}
+
+func exchangingOutcome() bindOutcome {
+	return bindOutcome{
+		Status: http.StatusOK,
+		managementResult: managementResult{
+			OK:      true,
+			Bound:   true,
+			Pending: true,
+			Message: "正在换票。",
+		},
+	}
+}
+
+// rejectedLoginOutcome is the page's answer after an exchange rejected a code.
+// A newer code, or a redeem that is still inside exchangeCode, stays pending
+// so the page keeps polling. A success terminal written by a concurrent paste
+// stays visible. The terminal rejection is only for the failed code that is
+// still the latest one.
+func rejectedLoginOutcome(id string, stored bool) bindOutcome {
+	if stillRedeeming(id) {
+		return exchangingOutcome()
+	}
+	if done, ok := doneTerminalOutcome(id); ok {
+		return done
+	}
+	result := managementResult{
+		Bound:   true,
+		Message: "授权码被拒绝，没有写入认证文件。请重新点登录后再授权。",
+	}
+	if stored {
+		result.Stored = true
+	}
+	return bindOutcome{
+		Status:           http.StatusOK,
+		managementResult: result,
+	}
+}
+
+// stillRedeeming reports whether the live session has an unclaimed code or a
+// redeem still inside exchangeCode. The check is after redeemCaptured returns,
+// so this call's own count is already dropped.
+func stillRedeeming(id string) bool {
+	sess := getSession(id)
+	if sess == nil {
+		return false
+	}
+	sessMu.Lock()
+	defer sessMu.Unlock()
+	if sessions[id] != sess {
+		return false
+	}
+	return sess.CapturedCode != "" || sess.exchanging > 0
+}
+
+func bindPastedCallbackResult(parts protocol.CallbackParts, callbackID string) bindOutcome {
 	if parts.Code == "" && parts.Secret == "" {
 		return bindOutcome{
 			Status: http.StatusBadRequest,
@@ -271,20 +525,23 @@ func bindPastedCallbackResult(parts protocol.CallbackParts) bindOutcome {
 		sess.CapturedRedirect = safeRedirect
 	}
 	sessMu.Unlock()
+	if sessionSaveBlocked(sess) {
+		return fileNotWrittenOutcome()
+	}
 
 	if parts.Code != "" {
 		if capturedCode == parts.Code {
-			return bindOutcome{
-				Status: http.StatusOK,
-				managementResult: managementResult{
-					OK:      true,
-					Bound:   true,
-					Stored:  true,
-					Message: "已交给进行中的登录。回到 CPAMP，保持「等待插件认证中」，等这一轮轮询结束。不要把这条 URL 贴进 CPA 的 OAuth 回调框。",
-				},
-			}
+			return exchangeBoundCode(sess, callbackID)
 		}
 		if claimed {
+			// The code is already with another redeem. Keep the page polling
+			// while it is in flight, and report a rejection that already happened.
+			if sessionBusy(sess) {
+				return exchangingOutcome()
+			}
+			if sessionExchangeFailed(sess) {
+				return rejectedLoginOutcome(sess.ID, false)
+			}
 			return bindOutcome{
 				Status: http.StatusOK,
 				managementResult: managementResult{
@@ -323,6 +580,86 @@ func bindPastedCallbackResult(parts protocol.CallbackParts) bindOutcome {
 			Message: "进行中的登录已经有 secret，这一条没有写入。",
 		},
 	}
+}
+
+func exchangeBoundCode(sess *loginSession, callbackID string) bindOutcome {
+	out := redeemCaptured(sess, callbackID)
+	if out.Busy {
+		return exchangingOutcome()
+	}
+	if out.SaveFailed {
+		return fileNotWrittenOutcome()
+	}
+	if out.Hard != nil {
+		return bindOutcome{
+			Status: http.StatusBadGateway,
+			managementResult: managementResult{
+				Bound:   true,
+				Message: "换票没有完成。请重新点登录后再授权。",
+			},
+		}
+	}
+	if out.Exchanged {
+		return bindOutcome{
+			Status: http.StatusOK,
+			managementResult: managementResult{
+				OK:      true,
+				Bound:   true,
+				Stored:  true,
+				Done:    true,
+				Label:   out.Label,
+				Message: "登录完成。认证文件已写入。",
+			},
+		}
+	}
+	if out.Rejected || out.PriorFailure {
+		return rejectedLoginOutcome(sess.ID, true)
+	}
+	return bindOutcome{
+		Status: http.StatusOK,
+		managementResult: managementResult{
+			OK:      true,
+			Bound:   true,
+			Message: "这条授权码已经交给过进行中的登录，不会再次换票。",
+		},
+	}
+}
+
+func managementLoginState(body []byte, query url.Values) string {
+	if state := jsonBodyField(body, "login_state"); state != "" {
+		return state
+	}
+	if state := jsonBodyField(body, "state"); state != "" {
+		return state
+	}
+	return firstQuery(query, "login_state", "state")
+}
+
+// pastedLoginState is the plugin page's session id. It is not the state Huawei
+// put on the callback URL. A callback "state" field must not select the session
+// by this path; captureCallback still reads that state from the URL.
+func pastedLoginState(body []byte) string {
+	return jsonBodyField(body, "login_state")
+}
+
+func jsonBodyField(body []byte, key string) string {
+	trim := bytesTrimLeft(body)
+	if len(trim) == 0 || trim[0] != '{' {
+		return ""
+	}
+	var m map[string]json.RawMessage
+	if json.Unmarshal(trim, &m) != nil {
+		return ""
+	}
+	return jsonStringField(m, key)
+}
+
+func bytesTrimLeft(body []byte) []byte {
+	i := 0
+	for i < len(body) && (body[i] == ' ' || body[i] == '\n' || body[i] == '\r' || body[i] == '\t') {
+		i++
+	}
+	return body[i:]
 }
 
 // finishBind adds the portal continue link for a first hop. The fixed message
@@ -502,12 +839,14 @@ func pageCSP() string {
 
 func managementPage() []byte {
 	cfg, _ := json.Marshal(map[string]string{
-		"post": managementCallbackFull,
-		"port": callbackPortLabel(),
+		"start":  managementLoginFull,
+		"post":   managementCallbackFull,
+		"status": managementStatusFull,
+		"port":   callbackPortLabel(),
 	})
 	page := `<!doctype html><html lang="zh-cn"><head><meta charset="utf-8">
 <meta name="referrer" content="no-referrer">
-<title>提交华为回调</title>
+<title>码道登录</title>
 <style>
 body{font:16px/1.5 sans-serif;margin:2rem auto;max-width:40rem;padding:0 1rem;color:#1a1a1a}
 label{display:block;margin:1rem 0 .3rem}
@@ -515,18 +854,20 @@ textarea,input{width:100%;box-sizing:border-box;font:inherit}
 textarea{min-height:6rem}
 button{margin-top:1rem;font:inherit;padding:.4rem 1rem}
 #result{white-space:pre-wrap}
-code{word-break:break-all}
+code,#authlink{word-break:break-all}
 </style></head><body>
-<h3>提交华为回调</h3>
-<p>在 CPAMP 里点过「开始 codearts 登录」后，卡片要一直停在「等待插件认证中」。不要取消。</p>
+<h3>码道登录</h3>
+<p>点「登录」，在打开的页面完成华为授权。不需要打开 CPAMP 的 OAuth 卡片。</p>
 <p>华为会把浏览器带到本机的 <code>http://127.0.0.1:__PORT__/oauth/callback?...</code>。如果 Chrome 显示无法连接，地址栏里的完整 URL 就是回调。把它贴到下面。</p>
 <p>不要把这条 URL 贴进 CPA 的 OAuth 回调框。那条入口认不出华为带回的 state。</p>
-<p>本机浏览器能打开回调页时，不用这个页面。监听器会自己收下授权码。</p>
+<p>本机浏览器能打开回调页时，不用粘贴。这一页会查询状态并完成登录。刷新后会接着查同一次登录。登录还在进行时，再点「登录」不会另开一次。</p>
+<p><label for="key">管理密钥（与登录 CPAMP 相同）</label>
+<input id="key" name="key" type="password" autocomplete="current-password"></p>
+<p><button id="login" type="button">登录</button></p>
+<p id="authlink"></p>
 <form id="form">
 <label for="url">地址栏里的完整 URL</label>
 <textarea id="url" name="url" spellcheck="false" autocomplete="off"></textarea>
-<label for="key">管理密钥（与登录 CPAMP 相同）</label>
-<input id="key" name="key" type="password" autocomplete="current-password">
 <button id="submit" type="submit">提交</button>
 </form>
 <p id="result" role="status"></p>
@@ -539,7 +880,14 @@ const urlBox = document.getElementById('url');
 const keyBox = document.getElementById('key');
 const result = document.getElementById('result');
 const button = document.getElementById('submit');
+const loginButton = document.getElementById('login');
 const storageKey = 'codearts.managementKey';
+const stateKey = 'codearts.loginState';
+let loginState = '';
+let loginPhase = 'idle';
+let pollTimer = 0;
+let pollGen = 0;
+let pollAbort = null;
 
 function textBytes(s){return new TextEncoder().encode(s)}
 function fromB64(b64){
@@ -584,18 +932,162 @@ function savedKey(){
   } catch (e) {}
   return readPanelKey();
 }
+function savedLoginState(){
+  try { return sessionStorage.getItem(stateKey) || ''; } catch (e) { return ''; }
+}
+function rememberLoginState(state){
+  try {
+    if (state) sessionStorage.setItem(stateKey, state);
+    else sessionStorage.removeItem(stateKey);
+  } catch (e) {}
+}
 function rememberKey(key, ok){
   try {
     if (!ok) sessionStorage.removeItem(storageKey);
     else if (key) sessionStorage.setItem(storageKey, key);
   } catch (e) {}
 }
-function postURL(){
+function apiURL(path){
   const marker = '/v0/resource/';
-  const path = location.pathname || '';
-  const at = path.indexOf(marker);
-  if (at >= 0) return path.slice(0, at) + cfg.post;
-  return cfg.post;
+  const loc = location.pathname || '';
+  const at = loc.indexOf(marker);
+  if (at >= 0) return loc.slice(0, at) + path;
+  return path;
+}
+function postURL(){return apiURL(cfg.post)}
+function stopPoll(){
+  if (pollTimer) { clearTimeout(pollTimer); pollTimer = 0; }
+  if (pollAbort) { pollAbort.abort(); pollAbort = null; }
+}
+function safeAuthURL(url){
+  if (typeof url !== 'string' || url === '') return '';
+  let parsed;
+  try { parsed = new URL(url); } catch (e) { return ''; }
+  if (parsed.protocol !== 'https:' || parsed.username || parsed.password) return '';
+  const host = parsed.hostname.toLowerCase();
+  if (host !== 'codearts.huaweicloud.com' && !host.endsWith('.huaweicloud.com')) return '';
+  return url;
+}
+function showAuthLink(url){
+  const box = document.getElementById('authlink');
+  box.replaceChildren();
+  const safe = safeAuthURL(url);
+  if (!safe) return;
+  const link = document.createElement('a');
+  link.href = safe;
+  link.target = '_blank';
+  link.rel = 'noopener noreferrer';
+  link.textContent = safe;
+  box.appendChild(link);
+}
+function showStatus(data, status, text){
+  result.textContent = resultMessage(status, text);
+  if (data && data.label) result.textContent += '（' + data.label + '）';
+  showContinue(data && data.continue_url);
+  if (status === 403) return;
+  if (data && data.pending === true) {
+    loginPhase = 'pending';
+    return;
+  }
+  if (data) loginPhase = 'terminal';
+  if (data && data.done === true) {
+    stopPoll();
+    forgetLogin();
+  }
+}
+async function fetchStatus(state){
+  const gen = pollGen;
+  const key = keyBox.value.replace(/[\r\n]/g, '').trim();
+  if (!state || !key) return null;
+  const abort = new AbortController();
+  if (gen !== pollGen || state !== loginState) return null;
+  if (pollAbort) pollAbort.abort();
+  pollAbort = abort;
+  try {
+    const resp = await fetch(apiURL(cfg.status), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Management-Key': key
+      },
+      body: JSON.stringify({state: state}),
+      credentials: 'same-origin',
+      signal: abort.signal
+    });
+    if (gen !== pollGen || state !== loginState) return null;
+    const text = await resp.text();
+    if (gen !== pollGen || state !== loginState) return null;
+    let data = null;
+    try { data = JSON.parse(text); } catch (e) {}
+    return {data: data, status: resp.status, text: text, gen: gen, state: state};
+  } catch (e) {
+    if (gen !== pollGen || state !== loginState) return null;
+    if (e && e.name === 'AbortError') return null;
+    return {error: true, gen: gen, state: state};
+  }
+}
+function phaseOf(data){
+  if (!data || typeof data !== 'object') return 'stale';
+  if (data.pending === true) return 'pending';
+  return 'terminal';
+}
+async function refreshSaved(){
+  const state = loginState;
+  const gen = pollGen;
+  const snapshot = await fetchStatus(state);
+  if (!snapshot || snapshot.error || gen !== pollGen || state !== loginState) return {phase: 'stale'};
+  if (snapshot.status === 403) {
+    rememberKey(keyBox.value.replace(/[\r\n]/g, '').trim(), false);
+    result.textContent = resultMessage(snapshot.status, snapshot.text);
+    return {phase: 'stale'};
+  }
+  const phase = phaseOf(snapshot.data);
+  if (phase === 'stale') return {phase: 'stale', status: snapshot.status, text: snapshot.text};
+  loginPhase = phase;
+  if (phase === 'pending') {
+    if (!urlBox.value.trim()) result.textContent = resultMessage(snapshot.status, snapshot.text);
+    return {phase: 'pending', data: snapshot.data};
+  }
+  showStatus(snapshot.data, snapshot.status, snapshot.text);
+  if (noLogin(snapshot.data)) forgetLogin();
+  return {phase: 'terminal', data: snapshot.data};
+}
+async function pollOnce(){
+  if (!loginState) return;
+  const gen = pollGen;
+  const state = loginState;
+  pollTimer = 0;
+  const snapshot = await fetchStatus(state);
+  if (!snapshot || gen !== pollGen || state !== loginState) return;
+  if (snapshot.status === 403) {
+    showStatus(snapshot.data, snapshot.status, snapshot.text);
+    rememberKey(keyBox.value.replace(/[\r\n]/g, '').trim(), false);
+    if (gen !== pollGen || state !== loginState) return;
+    pollTimer = setTimeout(pollOnce, 2000);
+    return;
+  }
+  if (snapshot.error || phaseOf(snapshot.data) === 'stale') {
+    if (gen !== pollGen || state !== loginState) return;
+    pollTimer = setTimeout(pollOnce, 2000);
+    return;
+  }
+  if (snapshot.data && snapshot.data.pending === true) {
+    loginPhase = 'pending';
+    if (!urlBox.value.trim() && gen === pollGen && state === loginState) result.textContent = resultMessage(snapshot.status, snapshot.text);
+    if (gen !== pollGen || state !== loginState) return;
+    pollTimer = setTimeout(pollOnce, 2000);
+    return;
+  }
+  if (gen !== pollGen || state !== loginState) return;
+  showStatus(snapshot.data, snapshot.status, snapshot.text);
+  if (noLogin(snapshot.data)) forgetLogin();
+}
+function resumeLogin(){
+  const gen = pollGen;
+  refreshSaved().then(function (saved) {
+    if (gen !== pollGen || !saved || saved.phase !== 'pending' || !loginState) return;
+    if (!pollTimer) pollTimer = setTimeout(pollOnce, 1000);
+  });
 }
 function resultMessage(status, text){
   try {
@@ -630,7 +1122,96 @@ function showContinue(url){
   link.textContent = '继续华为授权';
   box.appendChild(link);
 }
+function finishedLogin(data){
+  return !!(data && data.done === true);
+}
+function noLogin(data){
+  return !!(data && typeof data === 'object' && data.pending !== true && data.done !== true && data.bound !== true);
+}
+function forgetLogin(){
+  loginState = '';
+  rememberLoginState('');
+}
+function statusFailure(status, text){
+  let detail = '';
+  try {
+    const data = JSON.parse(text || '');
+    if (typeof data.message === 'string' && data.message) detail = data.message;
+    else if (typeof data.error === 'string' && data.error) detail = data.error;
+  } catch (e) {}
+  if (detail) return '没能查询这次登录的状态。' + detail;
+  if (status) return '没能查询这次登录的状态（' + status + '）。请再点一次。';
+  return '没能查询这次登录的状态。请再点一次。';
+}
 keyBox.value = savedKey();
+loginState = savedLoginState();
+loginButton.addEventListener('click', async function () {
+  const key = keyBox.value.replace(/[\r\n]/g, '').trim();
+  result.textContent = '';
+  showContinue('');
+  if (!key) {
+    result.textContent = '先填写管理密钥。它和登录 CPAMP 时相同。';
+    return;
+  }
+  const popup = window.open('', '_blank');
+  loginButton.disabled = true;
+  try {
+    if (loginState && loginPhase !== 'terminal') {
+      const saved = await refreshSaved();
+      if (saved.phase === 'pending') {
+        if (popup) popup.close();
+        result.textContent = '登录仍在进行。留着这一页即可。';
+        if (!pollTimer) pollTimer = setTimeout(pollOnce, 1000);
+        return;
+      }
+      if (saved.phase === 'terminal' && finishedLogin(saved.data)) {
+        if (popup) popup.close();
+        return;
+      }
+      if (saved.phase !== 'terminal') {
+        if (popup) popup.close();
+        if (!result.textContent) result.textContent = statusFailure(saved.status, saved.text);
+        return;
+      }
+    }
+    stopPoll();
+    pollGen++;
+    try {
+      const resp = await fetch(apiURL(cfg.start), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Management-Key': key
+        },
+        body: '{}',
+        credentials: 'same-origin'
+      });
+      const text = await resp.text();
+      let data = null;
+      try { data = JSON.parse(text); } catch (e) {}
+      const auth = data && safeAuthURL(data.auth_url);
+      const next = data && typeof data.state === 'string' ? data.state : '';
+      showAuthLink(auth || '');
+      if (popup) {
+        if (auth) popup.location = auth;
+        else popup.close();
+      }
+      result.textContent = resultMessage(resp.status, text);
+      rememberKey(key, resp.status !== 403);
+      if (next && data && data.pending) {
+        loginState = next;
+        loginPhase = 'pending';
+        rememberLoginState(next);
+        pollTimer = setTimeout(pollOnce, 1000);
+      }
+    } catch (e) {
+      if (popup) popup.close();
+      result.textContent = '登录没有送到 CPA。确认这个页面是从 CPA 打开的。';
+    }
+  } finally {
+    loginButton.disabled = false;
+  }
+});
 form.addEventListener('submit', async function (ev) {
   ev.preventDefault();
   const pasted = urlBox.value.trim();
@@ -646,6 +1227,8 @@ form.addEventListener('submit', async function (ev) {
     return;
   }
   button.disabled = true;
+  stopPoll();
+  pollGen++;
   try {
     const resp = await fetch(postURL(), {
       method: 'POST',
@@ -653,22 +1236,24 @@ form.addEventListener('submit', async function (ev) {
         'Content-Type': 'application/json',
         'X-Management-Key': key
       },
-      body: JSON.stringify({url: pasted}),
+      body: JSON.stringify({url: pasted, login_state: loginState}),
       credentials: 'same-origin'
     });
     const text = await resp.text();
     let data = null;
     try { data = JSON.parse(text); } catch (e) {}
-    result.textContent = resultMessage(resp.status, text);
+    showStatus(data, resp.status, text);
     if (!keepURL(data)) urlBox.value = '';
-    showContinue(data && data.continue_url);
     rememberKey(key, resp.status !== 403);
+    if (loginState && loginPhase !== 'terminal' && !pollTimer) pollTimer = setTimeout(pollOnce, 1000);
   } catch (e) {
     result.textContent = '提交没有送到 CPA。确认这个页面是从 CPA 打开的。';
+    if (loginState && loginPhase !== 'terminal' && !pollTimer) pollTimer = setTimeout(pollOnce, 1000);
   } finally {
     button.disabled = false;
   }
 });
+if (loginState) resumeLogin();
 </script>
 </body></html>`
 	page = strings.ReplaceAll(page, "__PORT__", callbackPortLabel())
