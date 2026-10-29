@@ -69,7 +69,7 @@ func PrepareChatBody(raw []byte, model string, stream bool) ([]byte, string, err
 		return nil, "", err
 	}
 	if choice.tools != nil {
-		out["tools"] = choice.tools
+		out["tools"] = sanitizeTools(choice.tools)
 		out["tool_choice"] = choice.mode
 	}
 
@@ -151,8 +151,10 @@ func selectTool(tools []any, name string) (any, error) {
 	return selected, nil
 }
 
-// rewriteMessages drops unpaired tool history and fills reasoning_content on
-// assistant messages that carry tool_calls. InferHub rejects both shapes.
+// rewriteMessages keeps only the fields InferHub accepts on a message.
+// Content arrays, extra roles, and unpaired tool history are flattened or
+// dropped. Assistant messages always carry reasoning_content: DeepSeek rejects
+// a tool-call replay that omits it.
 func rewriteMessages(raw any) ([]any, error) {
 	msgs, ok := raw.([]any)
 	if !ok {
@@ -163,28 +165,187 @@ func rewriteMessages(raw any) ([]any, error) {
 	for i, item := range msgs {
 		msg, _ := item.(map[string]any)
 		if msg == nil {
-			out = append(out, item)
 			continue
 		}
 		role, _ := msg["role"].(string)
-		switch strings.ToLower(strings.TrimSpace(role)) {
+		role = strings.ToLower(strings.TrimSpace(role))
+		switch role {
+		case "system", "developer", "user":
+			if role == "developer" {
+				role = "system"
+			}
+			text := flattenContent(msg["content"])
+			if strings.TrimSpace(text) == "" {
+				continue
+			}
+			out = append(out, map[string]any{"role": role, "content": text})
 		case "assistant":
-			copied := cloneMessage(msg)
-			if !keepCalls[i] {
-				delete(copied, "tool_calls")
-			} else if _, ok := copied["reasoning_content"]; !ok {
-				copied["reasoning_content"] = ""
+			wire := map[string]any{"role": "assistant"}
+			reasoning, _ := msg["reasoning_content"].(string)
+			wire["reasoning_content"] = reasoning
+			text := flattenContent(msg["content"])
+			if keepCalls[i] {
+				wire["tool_calls"] = sanitizeToolCalls(msg["tool_calls"])
+				if text == "" {
+					wire["content"] = nil
+				} else {
+					wire["content"] = text
+				}
+			} else {
+				wire["content"] = text
 			}
-			out = append(out, copied)
+			out = append(out, wire)
 		case "tool":
-			if keepResults[i] {
-				out = append(out, cloneMessage(msg))
+			if !keepResults[i] {
+				continue
 			}
+			text := flattenContent(msg["content"])
+			if strings.TrimSpace(text) == "" {
+				text = "(no output)"
+			}
+			wire := map[string]any{"role": "tool", "content": text}
+			if id, _ := msg["tool_call_id"].(string); id != "" {
+				wire["tool_call_id"] = id
+			}
+			if name, _ := msg["name"].(string); strings.TrimSpace(name) != "" {
+				wire["name"] = name
+			}
+			out = append(out, wire)
 		default:
-			out = append(out, cloneMessage(msg))
+			text := flattenContent(msg["content"])
+			if strings.TrimSpace(text) == "" {
+				continue
+			}
+			out = append(out, map[string]any{"role": "user", "content": text})
 		}
 	}
 	return out, nil
+}
+
+func flattenContent(raw any) string {
+	switch v := raw.(type) {
+	case nil:
+		return ""
+	case string:
+		return v
+	case []any:
+		var b strings.Builder
+		for _, item := range v {
+			part, _ := item.(map[string]any)
+			if part == nil {
+				continue
+			}
+			text, _ := part["text"].(string)
+			if text == "" {
+				text, _ = part["content"].(string)
+			}
+			if text == "" {
+				continue
+			}
+			if b.Len() > 0 {
+				b.WriteByte('\n')
+			}
+			b.WriteString(text)
+		}
+		return b.String()
+	default:
+		raw, err := json.Marshal(v)
+		if err != nil {
+			return ""
+		}
+		return string(raw)
+	}
+}
+
+func sanitizeToolCalls(raw any) []any {
+	calls, _ := raw.([]any)
+	out := make([]any, 0, len(calls))
+	for _, item := range calls {
+		obj, _ := item.(map[string]any)
+		if obj == nil {
+			continue
+		}
+		fn, _ := obj["function"].(map[string]any)
+		if fn == nil {
+			continue
+		}
+		name, _ := fn["name"].(string)
+		args := "{}"
+		switch v := fn["arguments"].(type) {
+		case string:
+			if strings.TrimSpace(v) != "" {
+				args = v
+			}
+		default:
+			if v != nil {
+				if encoded, err := json.Marshal(v); err == nil {
+					args = string(encoded)
+				}
+			}
+		}
+		wire := map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":      name,
+				"arguments": args,
+			},
+		}
+		if id, _ := obj["id"].(string); id != "" {
+			wire["id"] = id
+		}
+		out = append(out, wire)
+	}
+	return out
+}
+
+func sanitizeTools(tools []any) []any {
+	out := make([]any, 0, len(tools))
+	for _, item := range tools {
+		obj, _ := item.(map[string]any)
+		fn, _ := obj["function"].(map[string]any)
+		if fn == nil {
+			continue
+		}
+		name, _ := fn["name"].(string)
+		if strings.TrimSpace(name) == "" {
+			continue
+		}
+		wireFn := map[string]any{"name": name}
+		if desc, _ := fn["description"].(string); strings.TrimSpace(desc) != "" {
+			wireFn["description"] = desc
+		}
+		if params, ok := fn["parameters"]; ok && params != nil {
+			wireFn["parameters"] = sanitizeSchema(params)
+		} else {
+			wireFn["parameters"] = map[string]any{"type": "object", "properties": map[string]any{}}
+		}
+		out = append(out, map[string]any{"type": "function", "function": wireFn})
+	}
+	return out
+}
+
+func sanitizeSchema(raw any) any {
+	switch v := raw.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(v))
+		for key, value := range v {
+			switch key {
+			case "$schema", "strict", "additionalProperties", "unevaluatedProperties":
+				continue
+			default:
+				out[key] = sanitizeSchema(value)
+			}
+		}
+		return out
+	case []any:
+		out := make([]any, len(v))
+		for i, item := range v {
+			out[i] = sanitizeSchema(item)
+		}
+		return out
+	default:
+		return raw
+	}
 }
 
 func pairedToolIndexes(msgs []any) (map[int]bool, map[int]bool) {
