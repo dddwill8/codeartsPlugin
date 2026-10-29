@@ -82,8 +82,8 @@ func TestPrepareChatBodyRewritesNamedToolChoice(t *testing.T) {
 		"max_completion_tokens":128,
 		"frequency_penalty":0.2,
 		"tools":[
-			{"type":"function","function":{"name":"delete_file","parameters":{"type":"object"}}},
-			{"type":"function","function":{"name":"get_weather","description":"weather only","parameters":{"type":"object"}}}
+			{"type":"function","function":{"name":"delete_file","strict":true,"parameters":{"type":"object","$schema":"https://json-schema.org/draft/2020-12/schema","additionalProperties":false}}},
+			{"type":"function","function":{"name":"get_weather","description":"weather only","parameters":{"type":"object","strict":true}}}
 		],
 		"tool_choice":{"type":"function","function":{"name":"get_weather"}}
 	}`)
@@ -119,9 +119,12 @@ func TestPrepareChatBodyRewritesNamedToolChoice(t *testing.T) {
 		t.Fatalf("selected tool = %#v", fn)
 	}
 	msgs := got["messages"].([]any)
-	content := msgs[0].(map[string]any)["content"].([]any)
-	if content[0].(map[string]any)["type"] != "text" {
-		t.Fatalf("content was flattened: %#v", msgs[0])
+	if msgs[0].(map[string]any)["content"] != "weather" {
+		t.Fatalf("content was not flattened: %#v", msgs[0])
+	}
+	params := fn["parameters"].(map[string]any)
+	if _, ok := params["strict"]; ok || fn["strict"] != nil {
+		t.Fatalf("strict leaked into tool: %#v", fn)
 	}
 }
 
@@ -139,8 +142,9 @@ func TestPrepareChatBodyRejectsUnknownNamedTool(t *testing.T) {
 func TestPrepareChatBodyDropsUnpairedToolHistory(t *testing.T) {
 	raw := []byte(`{
 		"messages":[
+			{"role":"developer","content":[{"type":"text","text":"be brief"}]},
 			{"role":"user","content":"hi"},
-			{"role":"assistant","content":null,"tool_calls":[{"id":"call_old","type":"function","function":{"name":"bash","arguments":"{}"}}]},
+			{"role":"assistant","content":null,"tool_calls":[{"id":"call_old","type":"function","function":{"name":"bash","arguments":{}}}]},
 			{"role":"assistant","content":"ok","tool_calls":[{"id":"call_done","type":"function","function":{"name":"bash","arguments":"{}"}}]},
 			{"role":"tool","tool_call_id":"call_done","content":"/workspace"},
 			{"role":"tool","tool_call_id":"call_orphan","content":"drop me"}
@@ -156,17 +160,24 @@ func TestPrepareChatBodyDropsUnpairedToolHistory(t *testing.T) {
 	if err := json.Unmarshal(body, &got); err != nil {
 		t.Fatal(err)
 	}
-	if len(got.Messages) != 4 {
+	if len(got.Messages) != 5 {
 		t.Fatalf("messages = %#v", got.Messages)
 	}
-	if _, ok := got.Messages[1]["tool_calls"]; ok {
-		t.Fatalf("unpaired tool_calls kept: %#v", got.Messages[1])
+	if got.Messages[0]["role"] != "system" || got.Messages[0]["content"] != "be brief" {
+		t.Fatalf("developer message = %#v", got.Messages[0])
 	}
-	if got.Messages[2]["reasoning_content"] != "" {
-		t.Fatalf("reasoning_content = %#v", got.Messages[2]["reasoning_content"])
+	if _, ok := got.Messages[2]["tool_calls"]; ok {
+		t.Fatalf("unpaired tool_calls kept: %#v", got.Messages[2])
 	}
-	if got.Messages[3]["tool_call_id"] != "call_done" {
-		t.Fatalf("tool result = %#v", got.Messages[3])
+	if got.Messages[3]["reasoning_content"] != "" || got.Messages[3]["tool_calls"] == nil {
+		t.Fatalf("paired assistant = %#v", got.Messages[3])
+	}
+	call := got.Messages[3]["tool_calls"].([]any)[0].(map[string]any)
+	if call["function"].(map[string]any)["arguments"] != "{}" {
+		t.Fatalf("arguments = %#v", call)
+	}
+	if got.Messages[4]["tool_call_id"] != "call_done" {
+		t.Fatalf("tool result = %#v", got.Messages[4])
 	}
 	if strings.Contains(string(body), "call_orphan") || strings.Contains(string(body), "call_old") {
 		t.Fatalf("orphan history forwarded: %s", body)
