@@ -5,7 +5,7 @@ package protocol
 const (
 	PluginID      = "codearts"
 	PluginName    = "CodeArts (华为码道)"
-	PluginVersion = "0.1.4"
+	PluginVersion = "0.1.5"
 	PluginAuthor  = "codeartsPlugin"
 
 	// Provider is the CPA auth/executor identifier and auth-file type.
