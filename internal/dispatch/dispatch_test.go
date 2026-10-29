@@ -501,6 +501,53 @@ func TestExecutorUsesDiscoveredBenefitWhenUserIDEmpty(t *testing.T) {
 	}
 }
 
+func TestExecutorNormalizesHuaweiSSE(t *testing.T) {
+	resetForTest(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data:{\"text\":\"tex\"}\ndata:{\"text\":\"t\"}\ndata: [DONE]\n"))
+	}))
+	t.Cleanup(srv.Close)
+	SetEndpoints(endpointOverride{SnapEngine: srv.URL})
+	SetHTTPClient(srv.Client())
+
+	cred := protocol.Credential{
+		Type:            protocol.Provider,
+		AccessKeyID:     "AKIDsse",
+		SecretAccessKey: "sk-chat",
+		SecurityToken:   "sts-chat",
+		ClientID:        protocol.ClientID,
+	}
+	storage, _ := protocol.MarshalCredential(cred)
+	req, _ := json.Marshal(map[string]any{
+		"Model":       "DeepSeek-V4.1-Flash-1017",
+		"Payload":     []byte(`{"model":"DeepSeek-V4.1-Flash-1017","messages":[{"role":"user","content":"hi"}]}`),
+		"StorageJSON": storage,
+		"Stream":      false,
+	})
+	raw := mustResult(t, pluginabi.MethodExecutorExecute, req)
+	var resp pluginapi.ExecutorResponse
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(resp.Payload), "data:") {
+		t.Fatalf("sse leaked into json payload: %s", resp.Payload)
+	}
+	var obj struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(resp.Payload, &obj); err != nil {
+		t.Fatalf("payload is not json: %v\n%s", err, resp.Payload)
+	}
+	if len(obj.Choices) != 1 || obj.Choices[0].Message.Content != "text" {
+		t.Fatalf("content = %+v", obj.Choices)
+	}
+}
+
 func TestExecutorRetriesWithBenefitOnRouteMissed(t *testing.T) {
 	resetForTest(t)
 	var hits int

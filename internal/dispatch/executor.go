@@ -79,7 +79,7 @@ func handleExecute(request []byte, streamRPC bool) ([]byte, error) {
 	}
 
 	if stream {
-		return executeStream(req.HostCallbackID, req.StreamID, httpReq, func() (*http.Request, error) {
+		return executeStream(req.HostCallbackID, req.StreamID, model, httpReq, func() (*http.Request, error) {
 			if benefit {
 				return nil, nil
 			}
@@ -110,8 +110,12 @@ func handleExecute(request []byte, streamRPC bool) ([]byte, error) {
 		}
 		return errorEnvelope("upstream_error", "chat "+msg, code), nil
 	}
+	normalized, err := protocol.NormalizeNonStreamBody(rawResp, model)
+	if err != nil {
+		return errorEnvelope("upstream_error", "chat "+err.Error(), http.StatusBadGateway), nil
+	}
 	return okEnvelope(pluginapi.ExecutorResponse{
-		Payload: rawResp,
+		Payload: normalized,
 		Headers: http.Header{"Content-Type": []string{"application/json"}},
 	})
 }
@@ -134,7 +138,7 @@ func routeMissed(body []byte) bool {
 	return strings.Contains(s, "InferHub.002002009") || strings.Contains(s, "Route missed") || strings.Contains(s, "not registered")
 }
 
-func executeStream(callbackID, pluginStreamID string, httpReq *http.Request, retryBenefit func() (*http.Request, error)) ([]byte, error) {
+func executeStream(callbackID, pluginStreamID, model string, httpReq *http.Request, retryBenefit func() (*http.Request, error)) ([]byte, error) {
 	status, headers, hostStreamID, buffered, err := hostHTTPDoStream(callbackID, httpReq)
 	if err != nil {
 		return errorEnvelope("executor_error", err.Error(), http.StatusBadGateway), nil
@@ -181,24 +185,38 @@ func executeStream(callbackID, pluginStreamID string, httpReq *http.Request, ret
 	// Capture the caller that opened the stream before the goroutine is scheduled.
 	// A later SetCaller must not retarget reads, emits, or closes.
 	if owner := currentCaller(); hostStreamID != "" && pluginStreamID != "" && owner != nil {
-		go forwardHostStream(owner, hostStreamID, pluginStreamID)
+		go forwardHostStream(owner, hostStreamID, pluginStreamID, model)
 		return okEnvelope(map[string]any{"headers": headers})
 	}
 
-	if pluginStreamID != "" && currentCaller() != nil && len(buffered) > 0 {
-		_ = hostStreamEmit(pluginStreamID, buffered)
-		hostStreamClose(pluginStreamID, "")
+	translated, done, trErr := protocol.TranslateStreamChunk(buffered, model)
+	if trErr != nil {
+		return errorEnvelope("upstream_error", "chat "+trErr.Error(), http.StatusBadGateway), nil
+	}
+	if pluginStreamID != "" && currentCaller() != nil {
+		for _, payload := range translated {
+			if errEmit := hostStreamEmit(pluginStreamID, payload); errEmit != nil {
+				hostStreamClose(pluginStreamID, errEmit.Error())
+				return errorEnvelope("executor_error", errEmit.Error(), http.StatusBadGateway), nil
+			}
+		}
+		if done || len(buffered) > 0 {
+			hostStreamClose(pluginStreamID, "")
+		}
 		return okEnvelope(map[string]any{"headers": headers})
 	}
 
-	chunks := []pluginapi.ExecutorStreamChunk{{Payload: bytes.Clone(buffered)}}
+	chunks := make([]pluginapi.ExecutorStreamChunk, 0, len(translated))
+	for _, payload := range translated {
+		chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: payload})
+	}
 	return okEnvelope(map[string]any{
 		"headers": headers,
 		"chunks":  chunks,
 	})
 }
 
-func forwardHostStream(owner Caller, hostStreamID, pluginStreamID string) {
+func forwardHostStream(owner Caller, hostStreamID, pluginStreamID, model string) {
 	if owner == nil {
 		return
 	}
@@ -214,6 +232,7 @@ func forwardHostStream(owner Caller, hostStreamID, pluginStreamID string) {
 		}
 		hostStreamCloseOn(owner, pluginStreamID, "")
 	}()
+	var pending []byte
 	for {
 		if currentCaller() != owner {
 			return
@@ -223,9 +242,21 @@ func forwardHostStream(owner Caller, hostStreamID, pluginStreamID string) {
 			return
 		}
 		if len(payload) > 0 {
-			if errEmit := hostStreamEmitOn(owner, pluginStreamID, payload); errEmit != nil {
-				hostStreamCloseOn(owner, pluginStreamID, errEmit.Error())
+			pending = append(pending, payload...)
+		}
+		ready, rest := splitReadySSE(pending, done || err != nil)
+		pending = rest
+		if len(ready) > 0 {
+			translated, _, trErr := protocol.TranslateStreamChunk(ready, model)
+			if trErr != nil {
+				hostStreamCloseOn(owner, pluginStreamID, trErr.Error())
 				return
+			}
+			for _, chunk := range translated {
+				if errEmit := hostStreamEmitOn(owner, pluginStreamID, chunk); errEmit != nil {
+					hostStreamCloseOn(owner, pluginStreamID, errEmit.Error())
+					return
+				}
 			}
 		}
 		if err != nil {
@@ -236,6 +267,27 @@ func forwardHostStream(owner Caller, hostStreamID, pluginStreamID string) {
 			return
 		}
 	}
+}
+
+// splitReadySSE keeps a trailing partial line until the next read, unless
+// flush is set because the upstream stream has ended.
+func splitReadySSE(buf []byte, flush bool) (ready, rest []byte) {
+	if len(buf) == 0 {
+		return nil, nil
+	}
+	if flush {
+		return buf, nil
+	}
+	lastNL := -1
+	for i, b := range buf {
+		if b == '\n' {
+			lastNL = i
+		}
+	}
+	if lastNL < 0 {
+		return nil, buf
+	}
+	return buf[:lastNL+1], buf[lastNL+1:]
 }
 
 func handleExecutorHTTP(request []byte) ([]byte, error) {
