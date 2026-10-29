@@ -96,9 +96,13 @@ func handleAuthParse(request []byte) ([]byte, error) {
 	if err != nil {
 		return okEnvelope(pluginapi.AuthParseResponse{Handled: false})
 	}
+	auth := authDataFromCredential(c, fileName)
+	if merged, err := protocol.MergeCredential(raw, c); err == nil {
+		auth.StorageJSON = merged
+	}
 	return okEnvelope(pluginapi.AuthParseResponse{
 		Handled: true,
-		Auth:    authDataFromCredential(c, fileName),
+		Auth:    auth,
 	})
 }
 
@@ -297,12 +301,18 @@ func handleRefresh(request []byte) ([]byte, error) {
 	if (fileName == "" || fileName == "codearts-unknown.json") && derived != fileName {
 		fileName = derived
 	}
-	rawNext, err := protocol.MarshalCredential(next)
+	// Keep CPA-owned keys from the stored file (prefix, priority, proxy_url, ...).
+	rawNext, err := protocol.MergeCredential(raw, next)
 	if err != nil {
 		return errorEnvelope("refresh_error", err.Error(), http.StatusInternalServerError), nil
 	}
-	_ = hostAuthSave(fileName, rawNext)
+	if err := hostAuthSave(fileName, rawNext); err != nil {
+		// The old refresh_token is already spent. The returned Auth is now the
+		// only copy of the new one; CPA still persists it from this response.
+		log.Printf("codearts refresh auth save failed")
+	}
 	auth := authDataFromCredential(next, fileName)
+	auth.StorageJSON = rawNext
 	auth.ID = jsonString(request, "AuthID", "auth_id")
 	if auth.ID == "" {
 		auth.ID = protocol.FileNameFor(next)

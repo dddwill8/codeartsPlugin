@@ -181,6 +181,29 @@ func MarshalCredential(c Credential) ([]byte, error) {
 	return json.Marshal(c)
 }
 
+// MergeCredential overlays c onto the JSON object in original and returns the
+// result. Keys this plugin does not own (CPA's prefix, priority, proxy_url,
+// note, disabled, ...) are kept so a parse or refresh write does not drop
+// them. An empty or non-object original yields MarshalCredential(c).
+func MergeCredential(original []byte, c Credential) ([]byte, error) {
+	own, err := MarshalCredential(c)
+	if err != nil {
+		return nil, err
+	}
+	var base map[string]json.RawMessage
+	if len(original) == 0 || json.Unmarshal(original, &base) != nil || base == nil {
+		return own, nil
+	}
+	var overlay map[string]json.RawMessage
+	if err := json.Unmarshal(own, &overlay); err != nil {
+		return nil, err
+	}
+	for k, v := range overlay {
+		base[k] = v
+	}
+	return json.Marshal(base)
+}
+
 // LooksLikeCodeArts reports whether raw JSON is a CodeArts auth file.
 // Type is read from the raw object. ParseCredential still defaults an empty
 // type for credentials this plugin already owns; that default must not claim
