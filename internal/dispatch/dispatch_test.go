@@ -600,6 +600,96 @@ func TestExecutorRetriesWithBenefitOnRouteMissed(t *testing.T) {
 	}
 }
 
+func TestExecutorRewritesNamedToolChoiceBeforeUpstream(t *testing.T) {
+	resetForTest(t)
+	var gotBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-tools","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+	}))
+	t.Cleanup(srv.Close)
+	SetEndpoints(endpointOverride{SnapEngine: srv.URL})
+	SetHTTPClient(srv.Client())
+
+	cred := protocol.Credential{
+		Type:            protocol.Provider,
+		AccessKeyID:     "AKIDtools",
+		SecretAccessKey: "sk-chat",
+		SecurityToken:   "sts-chat",
+		ClientID:        protocol.ClientID,
+	}
+	storage, _ := protocol.MarshalCredential(cred)
+	payload := []byte(`{
+		"model":"codearts/DeepSeek-V4.1-Flash-1017",
+		"messages":[{"role":"user","content":"weather"}],
+		"tools":[
+			{"type":"function","function":{"name":"delete_file"}},
+			{"type":"function","function":{"name":"get_weather","description":"weather only"}}
+		],
+		"tool_choice":{"type":"function","function":{"name":"get_weather"}},
+		"user":"drop-me"
+	}`)
+	req, _ := json.Marshal(map[string]any{
+		"Model":        "codearts/DeepSeek-V4.1-Flash-1017",
+		"Payload":      payload,
+		"StorageJSON":  storage,
+		"Stream":       false,
+		"AuthMetadata": map[string]any{"prefix": "codearts"},
+	})
+	_ = mustResult(t, pluginabi.MethodExecutorExecute, req)
+
+	var got map[string]any
+	if err := json.Unmarshal(gotBody, &got); err != nil {
+		t.Fatalf("decode upstream body: %v\n%s", err, gotBody)
+	}
+	if got["model"] != "DeepSeek-V4.1-Flash-1017" || got["tool_choice"] != "required" {
+		t.Fatalf("body = %s", gotBody)
+	}
+	if _, ok := got["user"]; ok {
+		t.Fatalf("unknown field forwarded: %s", gotBody)
+	}
+	tools, _ := got["tools"].([]any)
+	if len(tools) != 1 || tools[0].(map[string]any)["function"].(map[string]any)["name"] != "get_weather" {
+		t.Fatalf("tools = %#v", tools)
+	}
+}
+
+func TestExecutorReturnsParamInvalidWithoutBenefitRetry(t *testing.T) {
+	resetForTest(t)
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error_code":"InferHub.001001005.400","error_msg":"The request param is invalid, Please check it"}`))
+	}))
+	t.Cleanup(srv.Close)
+	SetEndpoints(endpointOverride{SnapEngine: srv.URL})
+	SetHTTPClient(srv.Client())
+
+	cred := protocol.Credential{
+		Type:            protocol.Provider,
+		AccessKeyID:     "AKIDbad",
+		SecretAccessKey: "sk-chat",
+		SecurityToken:   "sts-chat",
+		ClientID:        protocol.ClientID,
+	}
+	storage, _ := protocol.MarshalCredential(cred)
+	req, _ := json.Marshal(map[string]any{
+		"Model":       "DeepSeek-V4.1-Flash-1017",
+		"Payload":     []byte(`{"model":"DeepSeek-V4.1-Flash-1017","messages":[{"role":"user","content":"hi"}]}`),
+		"StorageJSON": storage,
+		"Stream":      false,
+	})
+	env := mustHandle(t, pluginabi.MethodExecutorExecute, req)
+	if env.OK || env.Error == nil || env.Error.HTTPStatus != http.StatusBadRequest {
+		t.Fatalf("env = %+v", env.Error)
+	}
+	if hits != 1 || !strings.Contains(env.Error.Message, "InferHub.001001005.400") {
+		t.Fatalf("hits=%d message=%q", hits, env.Error.Message)
+	}
+}
+
 func TestModelRegisterAndStaticHaveNoOfflineCatalog(t *testing.T) {
 	resetForTest(t)
 	raw := mustResult(t, pluginabi.MethodModelRegister, nil)
