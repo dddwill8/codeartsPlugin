@@ -92,7 +92,7 @@ func handleExecute(request []byte, streamRPC bool) ([]byte, error) {
 	}
 	rawResp, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	_ = resp.Body.Close()
-	if resp.StatusCode == http.StatusNotFound && !benefit && routeMissed(rawResp) {
+	if resp.StatusCode == http.StatusNotFound && !benefit && routeMissed(rawResp) && !protocol.ParamInvalid(string(rawResp)) {
 		retryReq, retryErr := protocol.NewChatRequest(target, body, sign, model, true, false, protocol.SignOptions{})
 		if retryErr == nil {
 			resp2, err2 := hostHTTPDo(req.HostCallbackID, retryReq)
@@ -105,7 +105,9 @@ func handleExecute(request []byte, streamRPC bool) ([]byte, error) {
 	}
 	if msg := protocol.UpstreamChatError(resp.StatusCode, rawResp); msg != "" {
 		code := resp.StatusCode
-		if code < 400 {
+		if protocol.ParamInvalid(msg) {
+			code = http.StatusBadRequest
+		} else if code < 400 {
 			code = http.StatusBadGateway
 		}
 		return errorEnvelope("upstream_error", "chat "+msg, code), nil
@@ -151,7 +153,7 @@ func executeStream(callbackID, pluginStreamID, model string, httpReq *http.Reque
 			buffered = payload
 		}
 	}
-	if status == http.StatusNotFound && routeMissed(buffered) && retryBenefit != nil {
+	if status == http.StatusNotFound && routeMissed(buffered) && !protocol.ParamInvalid(string(buffered)) && retryBenefit != nil {
 		if retryReq, retryErr := retryBenefit(); retryErr == nil && retryReq != nil {
 			if hostStreamID != "" {
 				hostHTTPStreamClose(hostStreamID)
@@ -173,7 +175,11 @@ func executeStream(callbackID, pluginStreamID, model string, httpReq *http.Reque
 			}
 			hostHTTPStreamClose(hostStreamID)
 		}
-		return errorEnvelope("upstream_error", fmt.Sprintf("chat stream http=%d %s", status, truncate(string(buffered), 300)), status), nil
+		code := status
+		if protocol.ParamInvalid(string(buffered)) {
+			code = http.StatusBadRequest
+		}
+		return errorEnvelope("upstream_error", fmt.Sprintf("chat stream http=%d %s", status, truncate(string(buffered), 300)), code), nil
 	}
 	if headers == nil {
 		headers = http.Header{}
