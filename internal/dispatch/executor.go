@@ -52,12 +52,20 @@ func handleExecute(request []byte, streamRPC bool) ([]byte, error) {
 		payload = jsonBytes(request, "Payload", "payload", "OriginalRequest", "original_request")
 	}
 	stream := streamRPC || req.Stream || jsonBool(request, "Stream", "stream")
+	payloadModel := jsonString(payload, "model")
 	if model == "" {
-		model = jsonString(payload, "model")
+		model = payloadModel
 	}
-	// Huawei only knows the bare id (GLM-5.3). A CPA route name such as
-	// codearts/GLM-5.3 can reach here in req.Model or in the payload.
-	model = protocol.StripModelPrefix(model, authPrefix(req.AuthMetadata, req.AuthAttributes, raw), protocol.AccountKey(cred))
+	// Huawei only knows the bare id (GLM-5.3). CPA strips auth.Prefix from
+	// req.Model before a built-in executor runs, but a plugin still receives the
+	// client payload, so codearts/GLM-5.3 can remain in the body after req.Model
+	// is already GLM-5.3. Strip both before the body, benefit lookup, and headers.
+	prefix := authPrefix(req.AuthMetadata, req.AuthAttributes, raw)
+	model = protocol.StripModelPrefix(model, prefix)
+	payloadModel = protocol.StripModelPrefix(payloadModel, prefix)
+	if payloadModel != "" {
+		model = payloadModel
+	}
 	body, model, err := protocol.PrepareChatBody(payload, model, stream)
 	if err != nil {
 		return errorEnvelope("executor_error", err.Error(), http.StatusBadRequest), nil

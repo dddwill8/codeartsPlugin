@@ -73,6 +73,7 @@ func TestExecuteStripsConfiguredPrefix(t *testing.T) {
 		"storage prefix":   {extra: map[string]any{"Model": "codearts/GLM-5.3"}, storage: map[string]any{"prefix": "codearts"}},
 		"payload only":     {extra: map[string]any{"AuthMetadata": map[string]any{"prefix": "codearts"}}},
 		"host stripped id": {extra: map[string]any{"Model": "GLM-5.3", "AuthMetadata": map[string]any{"prefix": "codearts"}}},
+		"no prefix known":  {extra: map[string]any{"Model": "codearts/GLM-5.3"}},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -98,14 +99,40 @@ func TestExecuteStripsUnknownPrefixForDiscoveredModel(t *testing.T) {
 	}
 }
 
+func TestExecuteStripsPayloadWhenHostAlreadyStripped(t *testing.T) {
+	resetForTest(t)
+	var cap chatCapture
+	chatServer(t, &cap)
+	cred := protocol.Credential{Type: protocol.Provider, UserID: "u-prefix", AccessKeyID: "AK", SecretAccessKey: "sk", SecurityToken: "st"}
+	storage, err := protocol.MarshalCredential(cred)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(map[string]any{
+		"Model":       "GLM-5.3",
+		"Payload":     []byte(`{"model":"codearts/GLM-5.3","messages":[{"role":"user","content":"hi"}]}`),
+		"StorageJSON": storage,
+	})
+	env := mustHandle(t, pluginabi.MethodExecutorExecute, raw)
+	if !env.OK {
+		t.Fatalf("execute failed: %+v", env.Error)
+	}
+	if cap.model != "GLM-5.3" {
+		t.Fatalf("upstream model = %q", cap.model)
+	}
+}
+
 func TestStripModelPrefixKeepsUnknownSlashName(t *testing.T) {
-	if got := protocol.StripModelPrefix("vendor/unknown-model", "", "nobody"); got != "vendor/unknown-model" {
+	if got := protocol.StripModelPrefix("vendor/unknown-model", ""); got != "unknown-model" {
 		t.Fatalf("got %q", got)
 	}
-	if got := protocol.StripModelPrefix("GLM-5.3", "codearts", ""); got != "GLM-5.3" {
+	if got := protocol.StripModelPrefix("a/b/GLM-5.3", ""); got != "a/b/GLM-5.3" {
 		t.Fatalf("got %q", got)
 	}
-	if got := protocol.StripModelPrefix("codearts/GLM-5.3", "/codearts/", ""); got != "GLM-5.3" {
+	if got := protocol.StripModelPrefix("GLM-5.3", "codearts"); got != "GLM-5.3" {
+		t.Fatalf("got %q", got)
+	}
+	if got := protocol.StripModelPrefix("codearts/GLM-5.3", "/codearts/"); got != "GLM-5.3" {
 		t.Fatalf("got %q", got)
 	}
 }
