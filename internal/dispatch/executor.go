@@ -66,7 +66,7 @@ func handleExecute(request []byte, streamRPC bool) ([]byte, error) {
 	if payloadModel != "" {
 		model = payloadModel
 	}
-	body, model, err := protocol.PrepareChatBody(payload, model, stream)
+	body, model, err := protocol.PrepareChatBody(payload, model, stream, int(protocol.ModelMaxTokens(protocol.AccountKey(cred), model)))
 	if err != nil {
 		return errorEnvelope("executor_error", err.Error(), http.StatusBadRequest), nil
 	}

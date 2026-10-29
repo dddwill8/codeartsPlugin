@@ -29,6 +29,7 @@ func TestPostChatCompletionsSendsSignedHMAC(t *testing.T) {
 		[]byte(`{"model":"glm-5.3-flash","messages":[{"role":"user","content":"hi"}]}`),
 		"glm-5.3-flash",
 		false,
+		0,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -87,7 +88,7 @@ func TestPrepareChatBodyRewritesNamedToolChoice(t *testing.T) {
 		],
 		"tool_choice":{"type":"function","function":{"name":"get_weather"}}
 	}`)
-	body, model, err := PrepareChatBody(raw, "DeepSeek-V4.1-Flash-1017", true)
+	body, model, err := PrepareChatBody(raw, "DeepSeek-V4.1-Flash-1017", true, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +135,7 @@ func TestPrepareChatBodyRejectsUnknownNamedTool(t *testing.T) {
 		"tools":[{"type":"function","function":{"name":"other"}}],
 		"tool_choice":{"type":"function","function":{"name":"target"}}
 	}`)
-	if _, _, err := PrepareChatBody(raw, "GLM-5.3", false); err == nil || !strings.Contains(err.Error(), "not defined") {
+	if _, _, err := PrepareChatBody(raw, "GLM-5.3", false, 0); err == nil || !strings.Contains(err.Error(), "not defined") {
 		t.Fatalf("err = %v", err)
 	}
 }
@@ -150,7 +151,7 @@ func TestPrepareChatBodyDropsUnpairedToolHistory(t *testing.T) {
 			{"role":"tool","tool_call_id":"call_orphan","content":"drop me"}
 		]
 	}`)
-	body, _, err := PrepareChatBody(raw, "DeepSeek-V4.1-Flash-1017", false)
+	body, _, err := PrepareChatBody(raw, "DeepSeek-V4.1-Flash-1017", false, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,6 +182,55 @@ func TestPrepareChatBodyDropsUnpairedToolHistory(t *testing.T) {
 	}
 	if strings.Contains(string(body), "call_orphan") || strings.Contains(string(body), "call_old") {
 		t.Fatalf("orphan history forwarded: %s", body)
+	}
+}
+
+func TestPrepareChatBodyCapsOversizedMaxTokens(t *testing.T) {
+	raw := []byte(`{"messages":[{"role":"user","content":"hi"}],"max_completion_tokens":1048576}`)
+	body, _, err := PrepareChatBody(raw, "Kimi-K3", true, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), "max_tokens") {
+		t.Fatalf("oversized max tokens forwarded without a catalog limit: %s", body)
+	}
+	capped, _, err := PrepareChatBody(raw, "Kimi-K3", true, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(capped, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["max_tokens"] != float64(4096) {
+		t.Fatalf("max_tokens = %#v", got["max_tokens"])
+	}
+}
+
+func TestPrepareChatBodyFoldsToolSchemaConstraints(t *testing.T) {
+	raw := []byte(`{
+		"messages":[{"role":"user","content":"hi"}],
+		"tools":[{"type":"function","function":{"name":"render","parameters":{
+			"type":"object",
+			"additionalProperties":false,
+			"properties":{
+				"kind":{"const":"line","description":"chart"},
+				"page":{"anyOf":[{"type":"integer","minimum":1},{"type":"string"}],"maximum":600}
+			},
+			"required":["kind"]
+		}}}]
+	}`)
+	body, _, err := PrepareChatBody(raw, "Kimi-K3", false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, banned := range []string{"const", "anyOf", "minimum", "maximum", "additionalProperties"} {
+		if strings.Contains(string(body), `"`+banned+`"`) {
+			t.Fatalf("%s leaked: %s", banned, body)
+		}
+	}
+	if !strings.Contains(string(body), "allowed: line") || !strings.Contains(string(body), `"type":"integer"`) {
+		t.Fatalf("constraint was not preserved for the model: %s", body)
 	}
 }
 

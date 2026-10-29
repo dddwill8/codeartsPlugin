@@ -22,7 +22,7 @@ func ChatTarget(snapBase string) string {
 // Unknown fields are dropped. A named tool_choice object becomes the string
 // "required" with tools reduced to that one function: InferHub rejects the
 // object form with InferHub.001001005.400.
-func PrepareChatBody(raw []byte, model string, stream bool) ([]byte, string, error) {
+func PrepareChatBody(raw []byte, model string, stream bool, maxOutput int) ([]byte, string, error) {
 	var body map[string]any
 	if len(bytes.TrimSpace(raw)) == 0 {
 		body = map[string]any{}
@@ -50,8 +50,16 @@ func PrepareChatBody(raw []byte, model string, stream bool) ([]byte, string, err
 		}
 		out["messages"] = rewritten
 	}
-	if n, ok := firstInt(body, "max_tokens", "max_completion_tokens"); ok {
-		out["max_tokens"] = n
+	if n, ok := firstInt(body, "max_tokens", "max_completion_tokens"); ok && n > 0 {
+		if maxOutput > 0 && n > maxOutput {
+			n = maxOutput
+		}
+		// A client often copies the context window into max_completion_tokens.
+		// InferHub rejects that as an invalid parameter. Without a discovered
+		// output limit, omit the field instead of forwarding the oversized value.
+		if maxOutput > 0 || n <= defaultMaxOutput {
+			out["max_tokens"] = n
+		}
 	}
 	if v, ok := numberField(body, "temperature"); ok {
 		out["temperature"] = v
@@ -324,29 +332,132 @@ func sanitizeTools(tools []any) []any {
 	return out
 }
 
+// sanitizeSchema keeps the structure a model needs to call a tool and folds
+// constraints InferHub rejects into the description.
 func sanitizeSchema(raw any) any {
 	switch v := raw.(type) {
 	case map[string]any:
-		out := make(map[string]any, len(v))
-		for key, value := range v {
-			switch key {
-			case "$schema", "strict", "additionalProperties", "unevaluatedProperties":
-				continue
-			default:
-				out[key] = sanitizeSchema(value)
+		out := map[string]any{}
+		if typ := schemaType(v); typ != "" {
+			out["type"] = typ
+		}
+		if desc := schemaDescription(v); desc != "" {
+			out["description"] = desc
+		}
+		if props, _ := v["properties"].(map[string]any); len(props) > 0 {
+			clean := make(map[string]any, len(props))
+			for name, prop := range props {
+				clean[name] = sanitizeSchema(prop)
 			}
+			out["properties"] = clean
+		}
+		if req := stringList(v["required"]); len(req) > 0 {
+			out["required"] = req
+		}
+		if items, ok := v["items"]; ok && items != nil {
+			out["items"] = sanitizeSchema(items)
+		}
+		if len(out) == 0 {
+			out["type"] = "object"
 		}
 		return out
 	case []any:
-		out := make([]any, len(v))
-		for i, item := range v {
-			out[i] = sanitizeSchema(item)
+		if len(v) == 0 {
+			return map[string]any{"type": "object"}
 		}
-		return out
+		return sanitizeSchema(v[0])
 	default:
-		return raw
+		return map[string]any{"type": "object"}
 	}
 }
+
+func schemaType(v map[string]any) string {
+	if s, _ := v["type"].(string); s != "" {
+		return s
+	}
+	if types := stringList(v["type"]); len(types) > 0 {
+		return types[0]
+	}
+	for _, key := range []string{"anyOf", "oneOf", "allOf"} {
+		list, _ := v[key].([]any)
+		for _, item := range list {
+			obj, _ := item.(map[string]any)
+			if obj == nil {
+				continue
+			}
+			if typ := schemaType(obj); typ != "" {
+				return typ
+			}
+		}
+	}
+	return ""
+}
+
+func schemaDescription(v map[string]any) string {
+	desc, _ := v["description"].(string)
+	var notes []string
+	if values := append(stringList(v["enum"]), constString(v["const"])...); len(values) > 0 {
+		notes = append(notes, "allowed: "+strings.Join(values, ", "))
+	}
+	for _, key := range []string{"anyOf", "oneOf", "allOf"} {
+		list, _ := v[key].([]any)
+		for _, item := range list {
+			obj, _ := item.(map[string]any)
+			if obj == nil {
+				continue
+			}
+			if nested := schemaDescription(obj); nested != "" && nested != desc {
+				notes = append(notes, nested)
+			}
+		}
+	}
+	if len(notes) == 0 {
+		return strings.TrimSpace(desc)
+	}
+	if strings.TrimSpace(desc) == "" {
+		return strings.Join(notes, "; ")
+	}
+	return strings.TrimSpace(desc) + " (" + strings.Join(notes, "; ") + ")"
+}
+
+func constString(v any) []string {
+	switch n := v.(type) {
+	case nil:
+		return nil
+	case string:
+		if n == "" {
+			return nil
+		}
+		return []string{n}
+	default:
+		raw, err := json.Marshal(n)
+		if err != nil {
+			return nil
+		}
+		return []string{string(raw)}
+	}
+}
+
+func stringList(v any) []string {
+	switch n := v.(type) {
+	case []any:
+		out := make([]string, 0, len(n))
+		for _, item := range n {
+			s, _ := item.(string)
+			if s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	case []string:
+		return append([]string(nil), n...)
+	default:
+		return nil
+	}
+}
+
+const defaultMaxOutput = 8192
+
 
 func pairedToolIndexes(msgs []any) (map[int]bool, map[int]bool) {
 	resultIndex := map[string]int{}
