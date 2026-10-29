@@ -313,7 +313,10 @@ func fetchAgentModels(client *http.Client, cred SignCredential, snapBase string)
 	}
 	out := make([]ModelInfo, 0, len(detail.Gpts.Models))
 	for _, m := range detail.Gpts.Models {
-		id := firstNonEmpty(m.ModelName, m.ModelID, m.ModelAlias, m.Params.ModelID)
+		// model_name is the display label (DeepSeek-V4.1-Flash-1017). InferHub
+		// registers model_parameters.model_id (deepseek-v4.1-flash) and rejects
+		// the label as InferHub.001001005.400.
+		id := firstNonEmpty(m.Params.ModelID, m.ModelID, m.ModelName, m.ModelAlias)
 		if id == "" {
 			continue
 		}
