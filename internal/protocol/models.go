@@ -123,6 +123,46 @@ func IsBenefitModel(accountID, model string) bool {
 	return false
 }
 
+// StripModelPrefix returns the Huawei model id for a CPA route name.
+// CPA namespaces an auth's models as "<prefix>/<id>" when the auth file sets
+// prefix. Huawei only accepts the bare id, so a leading "<prefix>/" is
+// removed. When prefix is unknown, a single leading "<seg>/" is removed only
+// if the rest is a model this account (or any account) discovered; Huawei ids
+// themselves never contain "/".
+func StripModelPrefix(model, prefix, accountID string) string {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return model
+	}
+	if p := strings.Trim(strings.TrimSpace(prefix), "/"); p != "" {
+		if rest, ok := strings.CutPrefix(model, p+"/"); ok && rest != "" {
+			return rest
+		}
+	}
+	_, rest, ok := strings.Cut(model, "/")
+	if !ok || rest == "" || strings.Contains(rest, "/") {
+		return model
+	}
+	if knownModel(accountID, rest) {
+		return rest
+	}
+	return model
+}
+
+func knownModel(accountID, model string) bool {
+	key := strings.ToLower(strings.TrimSpace(model))
+	if key == "" {
+		return false
+	}
+	catalog.RLock()
+	defer catalog.RUnlock()
+	if ac, ok := catalog.accounts[accountID]; ok && ac.knows[key] {
+		return true
+	}
+	_, ok := catalog.known[key]
+	return ok
+}
+
 // CanonicalModel maps case variants to the ID last seen in discovery.
 func CanonicalModel(id string) string {
 	key := strings.ToLower(strings.TrimSpace(id))
