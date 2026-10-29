@@ -123,6 +123,27 @@ func IsBenefitModel(accountID, model string) bool {
 	return false
 }
 
+// ModelMaxTokens is the discovered maximum output for this account and model.
+// Zero means the catalog has no limit, so the caller must omit max_tokens.
+func ModelMaxTokens(accountID, model string) int64 {
+	key := strings.ToLower(strings.TrimSpace(model))
+	if key == "" {
+		return 0
+	}
+	catalog.RLock()
+	defer catalog.RUnlock()
+	ac, ok := catalog.accounts[accountID]
+	if !ok {
+		return 0
+	}
+	for _, mi := range ac.infos {
+		if strings.EqualFold(mi.ID, model) && mi.MaxTokens > 0 {
+			return mi.MaxTokens
+		}
+	}
+	return 0
+}
+
 // StripModelPrefix returns the Huawei model id for a CPA route name.
 // CPA namespaces an auth's models as "<prefix>/<id>" when the auth file sets
 // prefix. Huawei only accepts the bare id, so a leading "<prefix>/" is
