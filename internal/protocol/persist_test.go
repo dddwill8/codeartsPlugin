@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestFileNameForEmptyUserIDUsesAccessKey(t *testing.T) {
@@ -175,5 +176,39 @@ func TestLooksLikeCodeArts(t *testing.T) {
 				t.Fatalf("LooksLikeCodeArts(%s, %q) = %v, want %v", tc.raw, tc.file, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestUpdatedAtIsRFC3339String(t *testing.T) {
+	raw, err := MarshalCredential(Credential{AccessKeyID: "AK", SecretAccessKey: "sk", SecurityToken: "st", RefreshToken: "rt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := obj["updated_at"].(string)
+	if !ok {
+		t.Fatalf("updated_at = %#v, want RFC3339 string", obj["updated_at"])
+	}
+	if _, err := time.Parse(time.RFC3339Nano, got); err != nil {
+		t.Fatalf("updated_at %q: %v", got, err)
+	}
+
+	old := []byte(`{"type":"codearts","access_key_id":"AK","secret_access_key":"sk","security_token":"st","refresh_token":"rt","updated_at":1793264380}`)
+	parsed, err := ParseCredential(old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.UpdatedAt.IsZero() {
+		t.Fatal("unix updated_at did not parse")
+	}
+	rewritten, err := MarshalCredential(parsed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(rewritten), "1793264380") {
+		t.Fatalf("unix timestamp kept: %s", rewritten)
 	}
 }

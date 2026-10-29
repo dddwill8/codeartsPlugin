@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 	"time"
@@ -21,7 +22,9 @@ type Credential struct {
 	CodeVerifier    string            `json:"code_verifier,omitempty"`
 	ClientID        string            `json:"client_id,omitempty"`
 	DPoPPrivateKey  map[string]string `json:"dpop_private_key,omitempty"`
-	UpdatedAt       int64             `json:"updated_at,omitempty"`
+	// CPA unmarshals updated_at as time.Time, so a unix number makes the auth
+	// file unreadable and the model list empty. Accept the old number on read.
+	UpdatedAt flexTime `json:"updated_at,omitempty"`
 }
 
 // TokenResponse is the STS / oauth2/tokens JSON body.
@@ -102,7 +105,7 @@ func NewCredentialFromToken(tok TokenResponse, verifier string, clientID string,
 		RefreshToken:    tok.RefreshToken,
 		CodeVerifier:    verifier,
 		ClientID:        clientID,
-		UpdatedAt:       time.Now().Unix(),
+		UpdatedAt:       flexTime(time.Now().UTC()),
 	}
 	if len(dpop) > 0 {
 		c.DPoPPrivateKey = cloneStringMap(dpop)
@@ -145,7 +148,7 @@ func ApplyRefresh(prev Credential, tok TokenResponse) Credential {
 	if tok.DomainID != "" {
 		next.DomainID = tok.DomainID
 	}
-	next.UpdatedAt = time.Now().Unix()
+	next.UpdatedAt = flexTime(time.Now().UTC())
 	return next
 }
 
@@ -175,8 +178,8 @@ func MarshalCredential(c Credential) ([]byte, error) {
 	if c.ClientID == "" {
 		c.ClientID = ClientID
 	}
-	if c.UpdatedAt == 0 {
-		c.UpdatedAt = time.Now().Unix()
+	if c.UpdatedAt.IsZero() {
+		c.UpdatedAt = flexTime(time.Now().UTC())
 	}
 	return json.Marshal(c)
 }
@@ -262,6 +265,45 @@ func SignCredentialFrom(c Credential) SignCredential {
 		SecretAccessKey: c.SecretAccessKey,
 		SecurityToken:   c.SecurityToken,
 	}
+}
+
+// flexTime is stored as an RFC3339 string. Older auth files stored a unix
+// second count; those still parse so a refresh can rewrite them.
+type flexTime time.Time
+
+func (t flexTime) IsZero() bool { return time.Time(t).IsZero() }
+
+func (t flexTime) MarshalJSON() ([]byte, error) {
+	if t.IsZero() {
+		return []byte("null"), nil
+	}
+	return json.Marshal(time.Time(t).UTC().Format(time.RFC3339Nano))
+}
+
+func (t *flexTime) UnmarshalJSON(raw []byte) error {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || string(raw) == "null" {
+		*t = flexTime{}
+		return nil
+	}
+	if raw[0] == '"' {
+		var s string
+		if err := json.Unmarshal(raw, &s); err != nil {
+			return err
+		}
+		parsed, err := time.Parse(time.RFC3339Nano, s)
+		if err != nil {
+			return err
+		}
+		*t = flexTime(parsed)
+		return nil
+	}
+	var n int64
+	if err := json.Unmarshal(raw, &n); err != nil {
+		return err
+	}
+	*t = flexTime(time.Unix(n, 0).UTC())
+	return nil
 }
 
 func cloneStringMap(in map[string]string) map[string]string {
