@@ -126,10 +126,10 @@ func IsBenefitModel(accountID, model string) bool {
 // StripModelPrefix returns the Huawei model id for a CPA route name.
 // CPA namespaces an auth's models as "<prefix>/<id>" when the auth file sets
 // prefix. Huawei only accepts the bare id, so a leading "<prefix>/" is
-// removed. When prefix is unknown, a single leading "<seg>/" is removed only
-// if the rest is a model this account (or any account) discovered; Huawei ids
-// themselves never contain "/".
-func StripModelPrefix(model, prefix, accountID string) string {
+// removed. When prefix is unknown, a single leading "<seg>/" is still removed:
+// Huawei ids themselves never contain "/", and the in-process catalog is empty
+// until model.for_auth has run. A name with more than one slash is left as-is.
+func StripModelPrefix(model, prefix string) string {
 	model = strings.TrimSpace(model)
 	if model == "" {
 		return model
@@ -139,28 +139,20 @@ func StripModelPrefix(model, prefix, accountID string) string {
 			return rest
 		}
 	}
-	_, rest, ok := strings.Cut(model, "/")
-	if !ok || rest == "" || strings.Contains(rest, "/") {
+	rest, ok := singlePrefixRest(model)
+	if !ok {
 		return model
 	}
-	if knownModel(accountID, rest) {
-		return rest
-	}
-	return model
+	return rest
 }
 
-func knownModel(accountID, model string) bool {
-	key := strings.ToLower(strings.TrimSpace(model))
-	if key == "" {
-		return false
+// singlePrefixRest returns the part after one leading "<seg>/".
+func singlePrefixRest(model string) (string, bool) {
+	_, rest, ok := strings.Cut(model, "/")
+	if !ok || rest == "" || strings.Contains(rest, "/") {
+		return "", false
 	}
-	catalog.RLock()
-	defer catalog.RUnlock()
-	if ac, ok := catalog.accounts[accountID]; ok && ac.knows[key] {
-		return true
-	}
-	_, ok := catalog.known[key]
-	return ok
+	return rest, true
 }
 
 // CanonicalModel maps case variants to the ID last seen in discovery.
