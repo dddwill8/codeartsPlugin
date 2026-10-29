@@ -1,10 +1,12 @@
 package dispatch
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -13,6 +15,7 @@ import (
 	"time"
 
 	"github.com/dddwill8/codeartsPlugin/internal/protocol"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
@@ -96,10 +99,7 @@ func handleAuthParse(request []byte) ([]byte, error) {
 	if err != nil {
 		return okEnvelope(pluginapi.AuthParseResponse{Handled: false})
 	}
-	auth := authDataFromCredential(c, fileName)
-	if merged, err := protocol.MergeCredential(raw, c); err == nil {
-		auth.StorageJSON = merged
-	}
+	auth := authDataFromCredential(c, fileName, raw, true)
 	return okEnvelope(pluginapi.AuthParseResponse{
 		Handled: true,
 		Auth:    auth,
@@ -302,17 +302,15 @@ func handleRefresh(request []byte) ([]byte, error) {
 		fileName = derived
 	}
 	// Keep CPA-owned keys from the stored file (prefix, priority, proxy_url, ...).
-	rawNext, err := protocol.MergeCredential(raw, next)
-	if err != nil {
-		return errorEnvelope("refresh_error", err.Error(), http.StatusInternalServerError), nil
+	auth := authDataFromCredential(next, fileName, raw, false)
+	if len(auth.StorageJSON) == 0 {
+		return errorEnvelope("refresh_error", "encode credential", http.StatusInternalServerError), nil
 	}
-	if err := hostAuthSave(fileName, rawNext); err != nil {
+	if err := hostAuthSave(fileName, auth.StorageJSON); err != nil {
 		// The old refresh_token is already spent. The returned Auth is now the
 		// only copy of the new one; CPA still persists it from this response.
 		log.Printf("codearts refresh auth save failed")
 	}
-	auth := authDataFromCredential(next, fileName)
-	auth.StorageJSON = rawNext
 	auth.ID = jsonString(request, "AuthID", "auth_id")
 	if auth.ID == "" {
 		auth.ID = protocol.FileNameFor(next)
@@ -398,16 +396,16 @@ func finishLogin(sess *loginSession, tok protocol.TokenResponse, callbackID stri
 	if strings.TrimSpace(cred.UserID) == "" {
 		fillCredentialIdentity(callbackID, lc, &cred)
 	}
-	raw, err := protocol.MarshalCredential(cred)
-	if err != nil {
+	fileName := protocol.FileNameFor(cred)
+	auth := authDataFromCredential(cred, fileName, loadExistingAuthJSON(fileName), false)
+	if len(auth.StorageJSON) == 0 {
 		return pluginapi.AuthData{}, &statusError{
 			Code:   "login_error",
 			Status: http.StatusInternalServerError,
-			Msg:    err.Error(),
+			Msg:    "encode credential",
 		}
 	}
-	fileName := protocol.FileNameFor(cred)
-	if err := hostAuthSave(fileName, raw); err != nil {
+	if err := hostAuthSave(fileName, auth.StorageJSON); err != nil {
 		log.Printf("codearts auth save failed")
 		markSaveFailed(sess)
 		return pluginapi.AuthData{}, &statusError{
@@ -416,7 +414,6 @@ func finishLogin(sess *loginSession, tok protocol.TokenResponse, callbackID stri
 			Msg:    "认证文件没有写入。",
 		}
 	}
-	auth := authDataFromCredential(cred, fileName)
 	rememberTerminal(sess, auth.Label)
 	delSession(sess.ID)
 	return auth, nil
@@ -590,11 +587,18 @@ func pollTicket(callbackID string, lc protocol.LoginConfig, sess *loginSession, 
 	return protocol.ParseTokenResponse(body)
 }
 
-func authDataFromCredential(c protocol.Credential, fileName string) pluginapi.AuthData {
+func authDataFromCredential(c protocol.Credential, fileName string, original []byte, reuseSchedule bool) pluginapi.AuthData {
 	if fileName == "" {
 		fileName = protocol.FileNameFor(c)
 	}
-	raw, _ := protocol.MarshalCredential(c)
+	raw, err := protocol.MergeCredential(original, c)
+	if err != nil {
+		raw, _ = protocol.MarshalCredential(c)
+	}
+	when, secs := refreshSchedule(time.Now().UTC(), c.Expiration, storedStringField(original, "next_refresh_after"), reuseSchedule)
+	if !reuseSchedule {
+		raw = stampNextRefresh(raw, when)
+	}
 	label := c.UserName
 	if label == "" {
 		label = c.UserID
@@ -602,13 +606,13 @@ func authDataFromCredential(c protocol.Credential, fileName string) pluginapi.Au
 	if label == "" {
 		label = "CodeArts"
 	}
-	id := fileName
 	meta := map[string]any{
 		"type":      protocol.Provider,
 		"user_id":   c.UserID,
 		"user_name": c.UserName,
-		// codearts has no ProviderRefreshLead; CPA schedules refresh only when this is positive.
-		"refresh_interval_seconds": 600,
+		// codearts has no ProviderRefreshLead. CPA refreshes only when this is
+		// positive, and also when remaining life is within this many seconds.
+		"refresh_interval_seconds": secs,
 	}
 	if c.Expiration != "" {
 		meta["expires_at"] = c.Expiration
@@ -616,25 +620,217 @@ func authDataFromCredential(c protocol.Credential, fileName string) pluginapi.Au
 	if c.RefreshToken != "" {
 		meta["refresh_token"] = c.RefreshToken
 	}
-	return pluginapi.AuthData{
+	auth := pluginapi.AuthData{
 		Provider:         protocol.Provider,
-		ID:               id,
+		ID:               fileName,
 		FileName:         fileName,
 		Label:            label,
 		StorageJSON:      raw,
 		Metadata:         meta,
-		NextRefreshAfter: nextRefreshFromExpiration(c.Expiration),
+		NextRefreshAfter: when,
 	}
+	applyOperatorFields(&auth, raw)
+	return auth
 }
 
-// nextRefreshFromExpiration is a parseable expiration minus 5 minutes.
-// An empty or unparseable expiration is now plus 10 minutes.
-func nextRefreshFromExpiration(expiration string) time.Time {
-	exp, err := time.Parse(time.RFC3339, expiration)
-	if err != nil || exp.IsZero() {
-		return time.Now().UTC().Add(10 * time.Minute)
+const (
+	refreshMinDelay   = 10 * time.Minute
+	refreshMaxDelay   = 20 * time.Minute
+	refreshExpiryLead = 2 * time.Minute
+	refreshRetryFloor = 2 * time.Minute
+)
+
+// refreshJitter is now plus a uniform 10 to 20 minutes. Tests replace it.
+var refreshJitter = defaultRefreshJitter
+
+func defaultRefreshJitter(now time.Time) time.Time {
+	span := int((refreshMaxDelay-refreshMinDelay)/time.Second) + 1
+	n, err := rand.Int(rand.Reader, big.NewInt(int64(span)))
+	extra := 0
+	if err == nil {
+		extra = int(n.Int64())
 	}
-	return exp.Add(-5 * time.Minute)
+	return now.Add(refreshMinDelay + time.Duration(extra)*time.Second)
+}
+
+// refreshSchedule is the next STS refresh. A healthy token waits a random
+// 10-20 minutes. A token inside that window is refreshed 2 minutes before
+// it expires. An expired token, or one with less than 2 minutes left, waits
+// 2 minutes. The result is never due already: a past NextRefreshAfter makes
+// CPA refresh, rewrite the auth file, and reload it about a second later.
+// reuseStored keeps a future next_refresh_after across that reload. Login and
+// refresh pass false so a new credential gets a new slot.
+func refreshSchedule(now time.Time, expiration, stored string, reuseStored bool) (time.Time, int) {
+	now = now.UTC()
+	floor := now.Add(refreshRetryFloor)
+	exp, expOK := parseRFC3339(expiration)
+	if reuseStored {
+		if at, ok := parseRFC3339(stored); ok && at.After(now) {
+			switch {
+			case !expOK || exp.Sub(now) > refreshMaxDelay:
+				return scheduleResult(now, at)
+			case exp.Sub(now) > refreshExpiryLead:
+				sooner := exp.Add(-refreshExpiryLead)
+				if at.After(sooner) {
+					return scheduleResult(now, sooner)
+				}
+				return scheduleResult(now, at)
+			default:
+				return scheduleResult(now, floor)
+			}
+		}
+	}
+	var at time.Time
+	switch {
+	case !expOK || exp.Sub(now) > refreshMaxDelay:
+		at = refreshJitter(now)
+	case exp.Sub(now) > refreshExpiryLead:
+		at = exp.Add(-refreshExpiryLead)
+	default:
+		at = floor
+	}
+	return scheduleResult(now, at)
+}
+
+func scheduleResult(now, at time.Time) (time.Time, int) {
+	floor := now.Add(refreshRetryFloor)
+	if at.Before(floor) {
+		at = floor
+	}
+	secs := int(at.Sub(now) / time.Second)
+	if secs < int(refreshRetryFloor/time.Second) {
+		secs = int(refreshRetryFloor / time.Second)
+		at = floor
+	}
+	return at, secs
+}
+
+func parseRFC3339(s string) (time.Time, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Time{}, false
+	}
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
+		if ts, err := time.Parse(layout, s); err == nil && !ts.IsZero() {
+			return ts.UTC(), true
+		}
+	}
+	return time.Time{}, false
+}
+
+func storedStringField(raw []byte, key string) string {
+	var obj map[string]json.RawMessage
+	if len(raw) == 0 || json.Unmarshal(raw, &obj) != nil {
+		return ""
+	}
+	field, ok := obj[key]
+	if !ok {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(field, &s) != nil {
+		return ""
+	}
+	return s
+}
+
+func stampNextRefresh(raw []byte, at time.Time) []byte {
+	var obj map[string]any
+	if len(raw) == 0 || json.Unmarshal(raw, &obj) != nil || obj == nil {
+		return raw
+	}
+	obj["next_refresh_after"] = at.UTC().Format(time.RFC3339Nano)
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return raw
+	}
+	return out
+}
+
+// applyOperatorFields copies prefix, proxy_url, and a true disabled flag onto
+// the auth CPA keeps in memory. A missing disabled key stays false so a new
+// file does not gain disabled:false. The JSON itself is left unchanged.
+func applyOperatorFields(auth *pluginapi.AuthData, raw []byte) {
+	if auth == nil || len(raw) == 0 {
+		return
+	}
+	var obj map[string]any
+	if json.Unmarshal(raw, &obj) != nil || obj == nil {
+		return
+	}
+	if p, ok := obj["prefix"].(string); ok {
+		p = strings.Trim(strings.TrimSpace(p), "/")
+		if p != "" && !strings.Contains(p, "/") {
+			auth.Prefix = p
+		}
+	}
+	if p, ok := obj["proxy_url"].(string); ok {
+		if p = strings.TrimSpace(p); p != "" {
+			auth.ProxyURL = p
+		}
+	}
+	disabled, ok := obj["disabled"].(bool)
+	if !ok || !disabled {
+		return
+	}
+	auth.Disabled = true
+	if auth.Metadata == nil {
+		auth.Metadata = map[string]any{}
+	}
+	auth.Metadata["disabled"] = true
+}
+
+// loadExistingAuthJSON reads the auth file this login is about to replace.
+// A miss, including no host callback, writes a new file and does not fail login.
+// Only the exact file name is used, so another CodeArts account is not copied.
+func loadExistingAuthJSON(fileName string) []byte {
+	fileName = strings.TrimSpace(fileName)
+	if fileName == "" || currentCaller() == nil {
+		return nil
+	}
+	listed, err := callHost(pluginabi.MethodHostAuthList, map[string]any{})
+	if err != nil {
+		return nil
+	}
+	var list struct {
+		Files []struct {
+			Name      string `json:"name"`
+			AuthIndex string `json:"auth_index"`
+			Path      string `json:"path"`
+		} `json:"files"`
+	}
+	if json.Unmarshal(listed, &list) != nil {
+		return nil
+	}
+	var index string
+	for _, file := range list.Files {
+		name := strings.TrimSpace(file.Name)
+		if name != fileName && filepath.Base(strings.TrimSpace(file.Path)) != fileName {
+			continue
+		}
+		index = strings.TrimSpace(file.AuthIndex)
+		if index != "" {
+			break
+		}
+	}
+	if index == "" {
+		return nil
+	}
+	got, err := callHost(pluginabi.MethodHostAuthGet, map[string]any{"auth_index": index})
+	if err != nil {
+		return nil
+	}
+	var resp struct {
+		JSON json.RawMessage `json:"json"`
+	}
+	if json.Unmarshal(got, &resp) != nil || len(bytesTrim(resp.JSON)) == 0 {
+		return nil
+	}
+	return append([]byte(nil), resp.JSON...)
+}
+
+func bytesTrim(raw []byte) []byte {
+	return []byte(strings.TrimSpace(string(raw)))
 }
 
 func putSession(s *loginSession) {

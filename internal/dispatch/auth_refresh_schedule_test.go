@@ -19,29 +19,16 @@ import (
 func TestAuthRefreshSchedule(t *testing.T) {
 	const fractional = "2026-10-27T15:06:45.78Z"
 	t.Run("fractional RFC3339", func(t *testing.T) {
+		before := time.Now().UTC()
 		got := authRefreshNext(t, fractional)
-		exp, err := time.Parse(time.RFC3339, fractional)
-		if err != nil {
-			t.Fatal(err)
-		}
-		want := exp.Add(-5 * time.Minute)
-		if got.UnixNano() != want.UnixNano() {
-			t.Fatalf("NextRefreshAfter = %s (%d) want %s (%d)", got.Format(time.RFC3339Nano), got.UnixNano(), want.Format(time.RFC3339Nano), want.UnixNano())
-		}
+		assertScheduledRefresh(t, before, got, fractional)
 		t.Logf("NextRefreshAfter fractional=%s", got.UTC().Format(time.RFC3339Nano))
 	})
 
 	t.Run("unparseable", func(t *testing.T) {
 		before := time.Now().UTC()
 		got := authRefreshNext(t, "not-a-timestamp").UTC()
-		now := time.Now().UTC()
-		limit := now.Add(10 * time.Minute).Add(2 * time.Second)
-		if got.Before(before) || got.Before(now) {
-			t.Fatalf("NextRefreshAfter %s is before now %s", got.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano))
-		}
-		if got.After(limit) {
-			t.Fatalf("NextRefreshAfter %s is after now+10m+2s %s", got.Format(time.RFC3339Nano), limit.Format(time.RFC3339Nano))
-		}
+		assertScheduledRefresh(t, before, got, "not-a-timestamp")
 		t.Logf("NextRefreshAfter unparseable=%s", got.Format(time.RFC3339Nano))
 	})
 }
