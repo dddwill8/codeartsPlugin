@@ -158,6 +158,16 @@ func managementRegistration() managementRegistrationJSON {
 				Path:        managementStatusRoute,
 				Description: "查询本次登录状态。需要 CPA 管理认证。",
 			},
+			{
+				Method:      http.MethodGet,
+				Path:        managementReasoningRoute,
+				Description: "读取推理强度路由。需要 CPA 管理认证。",
+			},
+			{
+				Method:      http.MethodPost,
+				Path:        managementReasoningRoute,
+				Description: "保存推理强度路由。需要 CPA 管理认证。",
+			},
 		},
 		Resources: []resourceRouteJSON{{
 			Path:        resourceCallbackRoute,
@@ -191,6 +201,8 @@ func handleManagement(request []byte) ([]byte, error) {
 		return submitManagementCallback(req, callbackID)
 	case method == http.MethodPost && samePath(req.Path, managementStatusFull, managementStatusRoute):
 		return queryManagementLogin(req, callbackID)
+	case samePath(req.Path, managementReasoningFull, managementReasoningRoute):
+		return handleReasoning(request, callbackID)
 	case isResourceCallbackPath(req.Path):
 		// The public resource must not accept a code, even as POST with a body.
 		return managementJSON(http.StatusMethodNotAllowed, managementResult{
@@ -839,37 +851,56 @@ func pageCSP() string {
 
 func managementPage() []byte {
 	cfg, _ := json.Marshal(map[string]string{
-		"start":  managementLoginFull,
-		"post":   managementCallbackFull,
-		"status": managementStatusFull,
-		"port":   callbackPortLabel(),
+		"start":     managementLoginFull,
+		"post":      managementCallbackFull,
+		"status":    managementStatusFull,
+		"reasoning": managementReasoningFull,
+		"port":      callbackPortLabel(),
 	})
 	page := `<!doctype html><html lang="zh-cn"><head><meta charset="utf-8">
 <meta name="referrer" content="no-referrer">
 <title>码道登录</title>
 <style>
-body{font:16px/1.5 sans-serif;margin:2rem auto;max-width:40rem;padding:0 1rem;color:#1a1a1a}
-label{display:block;margin:1rem 0 .3rem}
-textarea,input{width:100%;box-sizing:border-box;font:inherit}
-textarea{min-height:6rem}
-button{margin-top:1rem;font:inherit;padding:.4rem 1rem}
+body{font:14px/1.4 sans-serif;margin:1rem;color:#1a1a1a}
+.hint{margin:0 0 .6rem;color:#333}
+.bar{display:flex;gap:.5rem;align-items:flex-end;flex-wrap:wrap}
+.bar form{display:contents}
+.bar label{display:flex;flex-direction:column;gap:.2rem;font-size:12px}
+.bar input,.bar textarea{width:18rem;box-sizing:border-box;font:inherit}
+.bar textarea{height:2.2rem;min-height:0;resize:vertical}
+button{font:inherit;padding:.35rem .7rem}
 #result{white-space:pre-wrap}
 code,#authlink{word-break:break-all}
+table{border-collapse:collapse;width:100%;margin-top:.4rem}
+th,td{border-bottom:1px solid #ddd;padding:.3rem .4rem;text-align:left;vertical-align:middle}
+select{font:inherit}
+.route-head{display:flex;gap:.8rem;align-items:center;margin-top:1rem}
 </style></head><body>
 <h3>码道登录</h3>
-<p>点「登录」，在打开的页面完成华为授权。不需要打开 CPAMP 的 OAuth 卡片。</p>
-<p>华为会把浏览器带到本机的 <code>http://127.0.0.1:__PORT__/oauth/callback?...</code>。如果 Chrome 显示无法连接，地址栏里的完整 URL 就是回调。把它贴到下面。</p>
-<p>不要把这条 URL 贴进 CPA 的 OAuth 回调框。那条入口认不出华为带回的 state。</p>
-<p>本机浏览器能打开回调页时，不用粘贴。这一页会查询状态并完成登录。刷新后会接着查同一次登录。登录还在进行时，再点「登录」不会另开一次。</p>
-<p><label for="key">管理密钥（与登录 CPAMP 相同）</label>
-<input id="key" name="key" type="password" autocomplete="current-password"></p>
-<p><button id="login" type="button">登录</button></p>
-<p id="authlink"></p>
+<p class="hint">点「登录」，在打开的页面完成华为授权。不需要打开 CPAMP 的 OAuth 卡片。回调打不开时，把地址栏里的完整 URL 贴到下面。不要把这条 URL 贴进 CPA 的 OAuth 回调框。本机浏览器能打开 <code>http://127.0.0.1:__PORT__/oauth/callback?...</code> 时不用粘贴。刷新后会接着查同一次登录。登录还在进行时，再点「登录」不会另开一次。</p>
+<div class="bar">
+<label for="key">管理密钥（与登录 CPAMP 相同）
+<input id="key" name="key" type="password" autocomplete="current-password"></label>
+<button id="login" type="button">登录</button>
 <form id="form">
-<label for="url">地址栏里的完整 URL</label>
-<textarea id="url" name="url" spellcheck="false" autocomplete="off"></textarea>
+<label for="url">地址栏里的完整 URL
+<textarea id="url" name="url" spellcheck="false" autocomplete="off"></textarea></label>
 <button id="submit" type="submit">提交</button>
 </form>
+</div>
+<p id="authlink"></p>
+<section>
+<div class="route-head">
+<label><input id="passthrough" type="checkbox" checked> 开启推理强度透传</label>
+<button id="route-refresh" type="button">刷新模型</button>
+<button id="route-save" type="button">保存路由</button>
+</div>
+<p id="route-note" class="hint"></p>
+<table>
+<thead><tr id="route-cols"><th>模型</th></tr></thead>
+<tbody id="route-body"></tbody>
+</table>
+</section>
 <p id="result" role="status"></p>
 <p id="continue"></p>
 <noscript><p>需要启用 JavaScript，才能带上管理密钥提交。没有脚本时这个页面不会把 URL 发出去。</p></noscript>
@@ -1253,6 +1284,111 @@ form.addEventListener('submit', async function (ev) {
     button.disabled = false;
   }
 });
+const levels = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh'];
+const targets = ['keep', 'drop'].concat(levels);
+const targetLabel = {keep: '原样', drop: '丢掉', none: 'none', minimal: 'minimal', low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', unknown: '未列出的强度'};
+let routeAccount = '';
+let routeModels = [];
+let routeMap = {};
+
+function routeCell(model, source) {
+  const select = document.createElement('select');
+  select.dataset.model = model;
+  select.dataset.source = source;
+  const bucket = routeMap[model] || routeMap[String(model).toLowerCase()] || {};
+  const current = bucket[source] || 'keep';
+  targets.forEach(function (value) {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = targetLabel[value] || value;
+    if (value === current) option.selected = true;
+    select.appendChild(option);
+  });
+  return select;
+}
+
+function renderRoutes() {
+  const cols = document.getElementById('route-cols');
+  const body = document.getElementById('route-body');
+  cols.replaceChildren();
+  body.replaceChildren();
+  const head = document.createElement('th');
+  head.textContent = '模型';
+  cols.appendChild(head);
+  levels.concat(['unknown']).forEach(function (source) {
+    const th = document.createElement('th');
+    th.textContent = targetLabel[source] || source;
+    cols.appendChild(th);
+  });
+  routeModels.forEach(function (model) {
+    const tr = document.createElement('tr');
+    const name = document.createElement('td');
+    name.textContent = model;
+    tr.appendChild(name);
+    levels.concat(['unknown']).forEach(function (source) {
+      const td = document.createElement('td');
+      td.appendChild(routeCell(model, source));
+      tr.appendChild(td);
+    });
+    body.appendChild(tr);
+  });
+}
+
+function applyRouteView(data) {
+  if (!data) return;
+  document.getElementById('passthrough').checked = data.passthrough !== false;
+  routeAccount = data.account || '';
+  routeModels = Array.isArray(data.models) ? data.models : [];
+  routeMap = data.routes && typeof data.routes === 'object' ? data.routes : {};
+  const note = document.getElementById('route-note');
+  note.textContent = data.message || (data.saved ? '使用已保存的路由。' : '未保存时，glm-5.3 的 none 和 minimal 会送到 low。');
+  renderRoutes();
+}
+
+async function loadRoutes() {
+  const key = keyBox.value.replace(/[\r\n]/g, '').trim();
+  if (!key) return;
+  try {
+    const resp = await fetch(apiURL(cfg.reasoning), {
+      method: 'GET',
+      headers: {'X-Management-Key': key},
+      credentials: 'same-origin'
+    });
+    const data = await resp.json();
+    if (resp.status === 403) return;
+    applyRouteView(data);
+  } catch (e) {}
+}
+
+document.getElementById('route-refresh').addEventListener('click', loadRoutes);
+document.getElementById('route-save').addEventListener('click', async function () {
+  const key = keyBox.value.replace(/[\r\n]/g, '').trim();
+  const note = document.getElementById('route-note');
+  if (!key) { note.textContent = '先填写管理密钥。'; return; }
+  const routes = {};
+  document.querySelectorAll('#route-body select').forEach(function (select) {
+    const model = select.dataset.model.toLowerCase();
+    if (!routes[model]) routes[model] = {};
+    if (select.value !== 'keep') routes[model][select.dataset.source] = select.value;
+  });
+  try {
+    const resp = await fetch(apiURL(cfg.reasoning), {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'X-Management-Key': key},
+      credentials: 'same-origin',
+      body: JSON.stringify({passthrough: document.getElementById('passthrough').checked, routes: routes})
+    });
+    const data = await resp.json();
+    applyRouteView(data);
+    if (!data.message) note.textContent = resp.ok ? '已保存。' : '没有保存。';
+  } catch (e) {
+    note.textContent = '没有送到 CPA。';
+  }
+});
+if (savedKey()) {
+  keyBox.value = savedKey();
+  loadRoutes();
+}
 if (loginState) resumeLogin();
 </script>
 </body></html>`

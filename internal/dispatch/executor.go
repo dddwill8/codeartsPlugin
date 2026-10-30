@@ -70,6 +70,7 @@ func handleExecute(request []byte, streamRPC bool) ([]byte, error) {
 	if err != nil {
 		return errorEnvelope("executor_error", err.Error(), http.StatusBadRequest), nil
 	}
+	body = protocol.ApplyReasoningPolicy(body, model, protocol.ReasoningPolicyFromAuth(raw))
 	benefit := protocol.IsBenefitModel(protocol.AccountKey(cred), model)
 	target := protocol.ChatTarget(snapEngineBase())
 	sign := protocol.SignCredentialFrom(cred)
@@ -197,7 +198,11 @@ func executeStream(callbackID, pluginStreamID, model string, httpReq *http.Reque
 
 	translated, done, trErr := protocol.TranslateStreamChunk(buffered, model)
 	if trErr != nil {
-		return errorEnvelope("upstream_error", "chat "+trErr.Error(), http.StatusBadGateway), nil
+		code := http.StatusBadGateway
+		if protocol.ParamInvalid(trErr.Error()) {
+			code = http.StatusBadRequest
+		}
+		return errorEnvelope("upstream_error", "chat "+trErr.Error(), code), nil
 	}
 	if pluginStreamID != "" && currentCaller() != nil {
 		for _, payload := range translated {
@@ -220,6 +225,14 @@ func executeStream(callbackID, pluginStreamID, model string, httpReq *http.Reque
 		"headers": headers,
 		"chunks":  chunks,
 	})
+}
+
+func closeStreamError(c Caller, streamID, errMsg string) {
+	status := 0
+	if protocol.ParamInvalid(errMsg) {
+		status = http.StatusBadRequest
+	}
+	hostStreamCloseStatus(c, streamID, errMsg, status)
 }
 
 func forwardHostStream(owner Caller, hostStreamID, pluginStreamID, model string) {
@@ -255,7 +268,7 @@ func forwardHostStream(owner Caller, hostStreamID, pluginStreamID, model string)
 		if len(ready) > 0 {
 			translated, _, trErr := protocol.TranslateStreamChunk(ready, model)
 			if trErr != nil {
-				hostStreamCloseOn(owner, pluginStreamID, trErr.Error())
+				closeStreamError(owner, pluginStreamID, trErr.Error())
 				return
 			}
 			for _, chunk := range translated {
@@ -266,7 +279,7 @@ func forwardHostStream(owner Caller, hostStreamID, pluginStreamID, model string)
 			}
 		}
 		if err != nil {
-			hostStreamCloseOn(owner, pluginStreamID, err.Error())
+			closeStreamError(owner, pluginStreamID, err.Error())
 			return
 		}
 		if done {

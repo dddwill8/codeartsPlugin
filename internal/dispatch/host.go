@@ -181,12 +181,25 @@ func hostStreamClose(streamID, errMsg string) {
 }
 
 func hostStreamCloseOn(c Caller, streamID, errMsg string) {
+	hostStreamCloseStatus(c, streamID, errMsg, 0)
+}
+
+// hostStreamCloseStatus closes a plugin stream. A positive status is sent as
+// error_detail so CPA can tell a client parameter error from an auth failure.
+func hostStreamCloseStatus(c Caller, streamID, errMsg string, status int) {
 	if strings.TrimSpace(streamID) == "" || c == nil {
 		return
 	}
 	payload := map[string]any{"stream_id": streamID}
 	if errMsg != "" {
 		payload["error"] = errMsg
+		if status > 0 {
+			payload["error_detail"] = map[string]any{
+				"code":        "upstream_error",
+				"message":     errMsg,
+				"http_status": status,
+			}
+		}
 	}
 	_, _ = callCaller(c, pluginabi.MethodHostStreamClose, payload)
 }

@@ -1147,20 +1147,35 @@ func TestManagementRegisterExposesCallbackPageAndAuthenticatedPost(t *testing.T)
 	if page.Menu != managementMenuName || page.Path != resourceCallbackRoute || page.Description == "" {
 		t.Fatalf("resource = %+v", page)
 	}
-	if len(reg.Routes) != 3 {
+	if len(reg.Routes) != 5 {
 		t.Fatalf("routes = %+v", reg.Routes)
 	}
 	got := map[string]managementRouteJSON{}
 	for _, route := range reg.Routes {
-		got[route.Path] = route
-		if route.Method != http.MethodPost || route.Menu != "" || route.Description == "" {
+		got[route.Method+" "+route.Path] = route
+		if route.Menu != "" || route.Description == "" {
+			t.Fatalf("route = %+v", route)
+		}
+		if route.Path == managementReasoningRoute {
+			if route.Method != http.MethodGet && route.Method != http.MethodPost {
+				t.Fatalf("route = %+v", route)
+			}
+			continue
+		}
+		if route.Method != http.MethodPost {
 			t.Fatalf("route = %+v", route)
 		}
 	}
 	for _, path := range []string{managementLoginRoute, managementCallbackRoute, managementStatusRoute} {
-		if _, ok := got[path]; !ok {
+		if _, ok := got[http.MethodPost+" "+path]; !ok {
 			t.Fatalf("missing %s in %+v", path, reg.Routes)
 		}
+	}
+	if _, ok := got[http.MethodGet+" "+managementReasoningRoute]; !ok {
+		t.Fatalf("missing reasoning GET in %+v", reg.Routes)
+	}
+	if _, ok := got[http.MethodPost+" "+managementReasoningRoute]; !ok {
+		t.Fatalf("missing reasoning POST in %+v", reg.Routes)
 	}
 	status, result, _ := callManagement(t, pluginapi.ManagementRequest{Method: http.MethodGet, Path: "/oauth"})
 	if status != http.StatusNotFound || result.Message == "" {

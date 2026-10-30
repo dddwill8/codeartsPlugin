@@ -241,4 +241,10 @@ func TestParamInvalidDetectsInferHubCode(t *testing.T) {
 	if ParamInvalid("InferHub.002002009.404 Route missed") {
 		t.Fatal("route miss is not a param error")
 	}
+	if !ParamInvalid("InferHub.ModelArts.81001.400 API 调用参数有误，请检查文档。") {
+		t.Fatal("expected modelarts param invalid")
+	}
+	if !ParamInvalid("ModelArts.81001 API 调用参数有误，请检查文档。") {
+		t.Fatal("expected bare modelarts param invalid")
+	}
 }
