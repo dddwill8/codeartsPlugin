@@ -458,7 +458,6 @@ func stringList(v any) []string {
 
 const defaultMaxOutput = 8192
 
-
 func pairedToolIndexes(msgs []any) (map[int]bool, map[int]bool) {
 	resultIndex := map[string]int{}
 	for i, item := range msgs {
@@ -638,7 +637,10 @@ func UpstreamChatError(status int, body []byte) string {
 // Retrying the same body with benefit headers cannot fix it.
 func ParamInvalid(msg string) bool {
 	low := strings.ToLower(msg)
-	return strings.Contains(low, "inferhub.001001005") || strings.Contains(low, "request param is invalid")
+	return strings.Contains(low, "inferhub.001001005") ||
+		strings.Contains(low, "request param is invalid") ||
+		strings.Contains(low, "modelarts.81001") ||
+		strings.Contains(msg, "API 调用参数有误")
 }
 
 func truncateRunes(s string, n int) string {
