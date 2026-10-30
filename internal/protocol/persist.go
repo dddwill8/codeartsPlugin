@@ -273,6 +273,9 @@ type flexTime time.Time
 
 func (t flexTime) IsZero() bool { return time.Time(t).IsZero() }
 
+// Time is the UTC instant stored in updated_at. The zero value stays zero.
+func (t flexTime) Time() time.Time { return time.Time(t).UTC() }
+
 func (t flexTime) MarshalJSON() ([]byte, error) {
 	if t.IsZero() {
 		return []byte("null"), nil

@@ -19,7 +19,8 @@ import (
 func TestAuthMetadataParse(t *testing.T) {
 	resetForTest(t)
 	const expiration = "2026-10-27T15:06:45.78Z"
-	rawJSON := []byte(`{"type":"codearts","access_key_id":"AKIDx","secret_access_key":"s","security_token":"t","refresh_token":"rt","expiration":"` + expiration + `"}`)
+	const issued = "2026-10-27T13:06:45.78Z"
+	rawJSON := []byte(`{"type":"codearts","access_key_id":"AKIDx","secret_access_key":"s","security_token":"t","refresh_token":"rt","expiration":"` + expiration + `","updated_at":"` + issued + `"}`)
 	req, err := json.Marshal(pluginapi.AuthParseRequest{RawJSON: rawJSON})
 	if err != nil {
 		t.Fatal(err)
@@ -33,13 +34,15 @@ func TestAuthMetadataParse(t *testing.T) {
 		t.Fatal("Handled = false")
 	}
 	assertAuthRefreshMeta(t, resp.Auth.Metadata, expiration, "rt")
-	assertScheduledRefresh(t, time.Now().UTC(), resp.Auth.NextRefreshAfter, expiration)
-	assertIntervalMatches(t, resp.Auth.Metadata, resp.Auth.NextRefreshAfter)
+	assertAuthSchedule(t, time.Now().UTC(), resp.Auth.NextRefreshAfter, resp.Auth.Metadata)
+	if resp.Auth.Metadata["last_refresh"] != issued {
+		t.Fatalf("last_refresh = %#v", resp.Auth.Metadata["last_refresh"])
+	}
 }
 
 func TestAuthMetadataRefresh(t *testing.T) {
 	resetForTest(t)
-	const expiration = "2026-10-27T15:06:45.78Z"
+	expiration := time.Now().UTC().Add(2 * time.Hour).Format(time.RFC3339Nano)
 	dpop, err := protocol.NewDPoPPrivateJWK()
 	if err != nil {
 		t.Fatal(err)
@@ -91,9 +94,8 @@ func TestAuthMetadataRefresh(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertAuthRefreshMeta(t, resp.Auth.Metadata, expiration, "rt-new")
-	assertScheduledRefresh(t, time.Now().UTC(), resp.NextRefreshAfter, expiration)
-	assertScheduledRefresh(t, time.Now().UTC(), resp.Auth.NextRefreshAfter, expiration)
-	assertIntervalMatches(t, resp.Auth.Metadata, resp.Auth.NextRefreshAfter)
+	assertAuthSchedule(t, time.Now().UTC(), resp.NextRefreshAfter, resp.Auth.Metadata)
+	assertAuthSchedule(t, time.Now().UTC(), resp.Auth.NextRefreshAfter, resp.Auth.Metadata)
 	if resp.NextRefreshAfter.UnixNano() != resp.Auth.NextRefreshAfter.UnixNano() {
 		t.Fatalf("NextRefreshAfter mismatch response=%s auth=%s", resp.NextRefreshAfter.Format(time.RFC3339Nano), resp.Auth.NextRefreshAfter.Format(time.RFC3339Nano))
 	}
@@ -131,49 +133,37 @@ func intervalSeconds(v any) (int, bool) {
 	}
 }
 
-func assertIntervalMatches(t *testing.T, meta map[string]any, when time.Time) {
+func assertAuthSchedule(t *testing.T, now, got time.Time, meta map[string]any) {
 	t.Helper()
+	now = now.UTC()
+	got = got.UTC()
 	secs, ok := intervalSeconds(meta["refresh_interval_seconds"])
 	if !ok {
 		t.Fatalf("refresh_interval_seconds = %#v", meta["refresh_interval_seconds"])
 	}
-	want := int(time.Until(when).Seconds())
-	if secs < 120 || secs > want+3 || secs < want-3 {
-		t.Fatalf("refresh_interval_seconds = %d, remaining until %s is about %d", secs, when.Format(time.RFC3339Nano), want)
-	}
-}
-
-func assertScheduledRefresh(t *testing.T, now, got time.Time, expiration string) {
-	t.Helper()
-	now = now.UTC()
-	got = got.UTC()
-	if !got.After(now.Add(refreshRetryFloor - 2*time.Second)) {
-		t.Fatalf("NextRefreshAfter %s is not at least 2 minutes after %s", got.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano))
-	}
-	exp, err := time.Parse(time.RFC3339, expiration)
-	if err != nil {
-		if got.Before(now.Add(refreshMinDelay-2*time.Second)) || got.After(now.Add(refreshMaxDelay+2*time.Second)) {
-			t.Fatalf("NextRefreshAfter %s is outside 10-20 minutes", got.Format(time.RFC3339Nano))
+	exp, expOK := parseRFC3339(fmt.Sprint(meta["expires_at"]))
+	issued, issOK := parseRFC3339(fmt.Sprint(meta["last_refresh"]))
+	if !expOK || !issOK {
+		if secs != 0 || !got.IsZero() {
+			t.Fatalf("unschedulable interval=%d next=%s", secs, got.Format(time.RFC3339Nano))
 		}
 		return
 	}
-	remaining := exp.Sub(now)
-	switch {
-	case remaining > refreshMaxDelay:
-		if got.Before(now.Add(refreshMinDelay-2*time.Second)) || got.After(now.Add(refreshMaxDelay+2*time.Second)) {
-			t.Fatalf("NextRefreshAfter %s is outside 10-20 minutes", got.Format(time.RFC3339Nano))
+	interval, okLife := refreshInterval(exp, issued)
+	if !okLife {
+		if secs != 0 || !got.IsZero() {
+			t.Fatalf("unschedulable interval=%d next=%s", secs, got.Format(time.RFC3339Nano))
 		}
-	case remaining > refreshExpiryLead:
-		want := exp.Add(-refreshExpiryLead)
-		if want.Before(now.Add(refreshRetryFloor)) {
-			want = now.Add(refreshRetryFloor)
-		}
-		if got.Before(want.Add(-2*time.Second)) || got.After(want.Add(2*time.Second)) {
-			t.Fatalf("NextRefreshAfter %s want about %s", got.Format(time.RFC3339Nano), want.Format(time.RFC3339Nano))
-		}
-	default:
-		if got.After(now.Add(refreshRetryFloor + 2*time.Second)) {
-			t.Fatalf("NextRefreshAfter %s is later than the 2 minute retry floor", got.Format(time.RFC3339Nano))
-		}
+		return
+	}
+	if secs != int(interval/time.Second) {
+		t.Fatalf("refresh_interval_seconds = %d, want %d", secs, int(interval/time.Second))
+	}
+	want := now.Add(refreshRetryFloor)
+	if exp.After(now) && exp.Sub(now) > interval {
+		want = exp.Add(-interval)
+	}
+	if got.Before(want.Add(-3*time.Second)) || got.After(want.Add(3*time.Second)) {
+		t.Fatalf("NextRefreshAfter %s want about %s", got.Format(time.RFC3339Nano), want.Format(time.RFC3339Nano))
 	}
 }

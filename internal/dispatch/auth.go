@@ -1,12 +1,10 @@
 package dispatch
 
 import (
-	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
-	"math/big"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -263,7 +261,7 @@ func handleRefresh(request []byte) ([]byte, error) {
 		return errorEnvelope("refresh_error", err.Error(), http.StatusBadRequest), nil
 	}
 	if prev.RefreshToken == "" || prev.ClientID == "" || prev.DPoPPrivateKey["d"] == "" {
-		return errorEnvelope("refresh_error", "credential missing client_id, refresh_token, or DPoP private key", http.StatusUnauthorized), nil
+		return errorEnvelope("refresh_error", "credential missing client_id, refresh_token, or DPoP private key", http.StatusBadGateway), nil
 	}
 	lc := loginConfig()
 	lc.ClientID = prev.ClientID
@@ -280,11 +278,16 @@ func handleRefresh(request []byte) ([]byte, error) {
 	defer resp.Body.Close()
 	body, _ := protocol.ReadAllLimited(resp.Body, 4<<20)
 	if resp.StatusCode >= 400 {
-		status := resp.StatusCode
-		if status == http.StatusBadRequest {
-			status = http.StatusUnauthorized
+		code := stsErrorCode(body)
+		log.Printf("codearts sts refresh http=%d error=%s", resp.StatusCode, code)
+		// CPA treats HTTP 401 as a terminal unauthorized failure and stops
+		// scheduling. STS 400 stays 400 so invalid_grant keeps backing off.
+		// Every other failure is 502, which CPA retries.
+		status := http.StatusBadGateway
+		if resp.StatusCode == http.StatusBadRequest {
+			status = http.StatusBadRequest
 		}
-		return errorEnvelope("refresh_error", fmt.Sprintf("sts refresh http=%d body=%s", resp.StatusCode, truncate(string(body), 240)), status), nil
+		return errorEnvelope("refresh_error", fmt.Sprintf("sts refresh http=%d error=%s", resp.StatusCode, code), status), nil
 	}
 	tok, err := protocol.ParseTokenResponse(body)
 	if err != nil {
@@ -595,8 +598,8 @@ func authDataFromCredential(c protocol.Credential, fileName string, original []b
 	if err != nil {
 		raw, _ = protocol.MarshalCredential(c)
 	}
-	when, secs := refreshSchedule(time.Now().UTC(), c.Expiration, storedStringField(original, "next_refresh_after"), reuseSchedule)
-	if !reuseSchedule {
+	when, secs := refreshSchedule(time.Now().UTC(), c.Expiration, c.UpdatedAt.Time())
+	if !reuseSchedule && !when.IsZero() {
 		raw = stampNextRefresh(raw, when)
 	}
 	label := c.UserName
@@ -610,9 +613,14 @@ func authDataFromCredential(c protocol.Credential, fileName string, original []b
 		"type":      protocol.Provider,
 		"user_id":   c.UserID,
 		"user_name": c.UserName,
-		// codearts has no ProviderRefreshLead. CPA refreshes only when this is
-		// positive, and also when remaining life is within this many seconds.
+		// codearts has no ProviderRefreshLead. CPA treats this one value as
+		// both the refresh period and the lead. It must be half this
+		// credential's lifetime, not the seconds until NextRefreshAfter.
+		// Zero means the lifetime is unknown, so CPA does not refresh.
 		"refresh_interval_seconds": secs,
+	}
+	if !c.UpdatedAt.IsZero() {
+		meta["last_refresh"] = c.UpdatedAt.Time().Format(time.RFC3339Nano)
 	}
 	if c.Expiration != "" {
 		meta["expires_at"] = c.Expiration
@@ -633,76 +641,77 @@ func authDataFromCredential(c protocol.Credential, fileName string, original []b
 	return auth
 }
 
-const (
-	refreshMinDelay   = 10 * time.Minute
-	refreshMaxDelay   = 20 * time.Minute
-	refreshExpiryLead = 2 * time.Minute
-	refreshRetryFloor = 2 * time.Minute
-)
+const refreshRetryFloor = 2 * time.Minute
 
-// refreshJitter is now plus a uniform 10 to 20 minutes. Tests replace it.
-var refreshJitter = defaultRefreshJitter
-
-func defaultRefreshJitter(now time.Time) time.Time {
-	span := int((refreshMaxDelay-refreshMinDelay)/time.Second) + 1
-	n, err := rand.Int(rand.Reader, big.NewInt(int64(span)))
-	extra := 0
-	if err == nil {
-		extra = int(n.Int64())
-	}
-	return now.Add(refreshMinDelay + time.Duration(extra)*time.Second)
-}
-
-// refreshSchedule is the next STS refresh. A healthy token waits a random
-// 10-20 minutes. A token inside that window is refreshed 2 minutes before
-// it expires. An expired token, or one with less than 2 minutes left, waits
-// 2 minutes. The result is never due already: a past NextRefreshAfter makes
-// CPA refresh, rewrite the auth file, and reload it about a second later.
-// reuseStored keeps a future next_refresh_after across that reload. Login and
-// refresh pass false so a new credential gets a new slot.
-func refreshSchedule(now time.Time, expiration, stored string, reuseStored bool) (time.Time, int) {
+// refreshSchedule is the next STS refresh and the CPA interval.
+// The interval is half of expiration-issued. CPA uses that single number as
+// both the period and the lead, so it must stay strictly below the lifetime.
+// A healthy token is refreshed at expiration minus that half. A token already
+// inside the second half, or an expired one, waits two minutes. The result is
+// never due already: a past NextRefreshAfter makes CPA refresh, rewrite the
+// auth file, and reload it about a second later. An unknown lifetime returns
+// a zero time and a zero interval, and CPA does not refresh.
+func refreshSchedule(now time.Time, expiration string, issued time.Time) (time.Time, int) {
 	now = now.UTC()
-	floor := now.Add(refreshRetryFloor)
 	exp, expOK := parseRFC3339(expiration)
-	if reuseStored {
-		if at, ok := parseRFC3339(stored); ok && at.After(now) {
-			switch {
-			case !expOK || exp.Sub(now) > refreshMaxDelay:
-				return scheduleResult(now, at)
-			case exp.Sub(now) > refreshExpiryLead:
-				sooner := exp.Add(-refreshExpiryLead)
-				if at.After(sooner) {
-					return scheduleResult(now, sooner)
-				}
-				return scheduleResult(now, at)
-			default:
-				return scheduleResult(now, floor)
-			}
-		}
+	if !expOK {
+		return time.Time{}, 0
 	}
-	var at time.Time
-	switch {
-	case !expOK || exp.Sub(now) > refreshMaxDelay:
-		at = refreshJitter(now)
-	case exp.Sub(now) > refreshExpiryLead:
-		at = exp.Add(-refreshExpiryLead)
-	default:
-		at = floor
+	interval, ok := refreshInterval(exp, issued.UTC())
+	if !ok {
+		return time.Time{}, 0
 	}
-	return scheduleResult(now, at)
+	at := now.Add(refreshRetryFloor)
+	if exp.After(now) && exp.Sub(now) > interval {
+		at = exp.Add(-interval)
+	}
+	return at, int(interval / time.Second)
 }
 
-func scheduleResult(now, at time.Time) (time.Time, int) {
-	floor := now.Add(refreshRetryFloor)
-	if at.Before(floor) {
-		at = floor
+// refreshInterval is half the STS lifetime, truncated to whole seconds.
+// It is false when the half would be zero or at least as long as the lifetime.
+func refreshInterval(exp, issued time.Time) (time.Duration, bool) {
+	if exp.IsZero() || issued.IsZero() || !exp.After(issued) {
+		return 0, false
 	}
-	secs := int(at.Sub(now) / time.Second)
-	if secs < int(refreshRetryFloor/time.Second) {
-		secs = int(refreshRetryFloor / time.Second)
-		at = floor
+	life := exp.Sub(issued)
+	secs := int(life / 2 / time.Second)
+	if secs < 1 {
+		return 0, false
 	}
-	return at, secs
+	interval := time.Duration(secs) * time.Second
+	if interval >= life {
+		return 0, false
+	}
+	return interval, true
+}
+
+// stsErrorCode is the OAuth error code from an STS failure body.
+// The raw body is not returned: CPA treats the substrings "status 401" and
+// "401 unauthorized" as a terminal auth failure.
+func stsErrorCode(body []byte) string {
+	var obj struct {
+		Error     string `json:"error"`
+		ErrorCode string `json:"error_code"`
+	}
+	if json.Unmarshal(body, &obj) != nil {
+		return "unknown"
+	}
+	code := strings.TrimSpace(obj.Error)
+	if code == "" {
+		code = strings.TrimSpace(obj.ErrorCode)
+	}
+	if code == "" {
+		return "unknown"
+	}
+	lower := strings.ToLower(code)
+	if strings.Contains(lower, "status 401") || strings.Contains(lower, "401 unauthorized") {
+		return "unknown"
+	}
+	if len(code) > 80 {
+		code = code[:80]
+	}
+	return code
 }
 
 func parseRFC3339(s string) (time.Time, bool) {

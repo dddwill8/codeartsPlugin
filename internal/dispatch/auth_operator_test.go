@@ -17,92 +17,51 @@ import (
 )
 
 func TestRefreshSchedule(t *testing.T) {
-	now := time.Date(2026, 10, 29, 12, 0, 0, 0, time.UTC)
-	old := refreshJitter
-	refreshJitter = func(at time.Time) time.Time { return at.Add(15 * time.Minute) }
-	t.Cleanup(func() { refreshJitter = old })
+	now := time.Date(2026, 10, 29, 13, 7, 31, 658100796, time.UTC)
+	issued := now
+	exp := time.Date(2026, 10, 29, 15, 7, 31, 601000000, time.UTC)
+	const half = 3599 * time.Second
 
-	t.Run("long life", func(t *testing.T) {
-		exp := now.Add(24 * time.Hour).Format(time.RFC3339Nano)
-		at, secs := refreshSchedule(now, exp, "", false)
-		if !at.Equal(now.Add(15*time.Minute)) || secs != 15*60 {
+	t.Run("two hour token waits until half life", func(t *testing.T) {
+		at, secs := refreshSchedule(now, exp.Format(time.RFC3339Nano), issued)
+		if secs != int(half/time.Second) || !at.Equal(exp.Add(-half)) {
 			t.Fatalf("at=%s secs=%d", at.Format(time.RFC3339Nano), secs)
 		}
 	})
-	t.Run("fractional inside window", func(t *testing.T) {
-		exp := now.Add(8*time.Minute + 780*time.Millisecond)
-		at, secs := refreshSchedule(now, exp.Format(time.RFC3339Nano), "", false)
-		if !at.Equal(exp.Add(-2*time.Minute)) || secs != 6*60 {
+	t.Run("inside the second half waits two minutes", func(t *testing.T) {
+		at, secs := refreshSchedule(exp.Add(-30*time.Minute), exp.Format(time.RFC3339Nano), issued)
+		want := exp.Add(-30 * time.Minute).Add(refreshRetryFloor)
+		if secs != int(half/time.Second) || !at.Equal(want) {
 			t.Fatalf("at=%s secs=%d", at.Format(time.RFC3339Nano), secs)
 		}
 	})
-	t.Run("short life uses floor", func(t *testing.T) {
-		exp := now.Add(3 * time.Minute).Format(time.RFC3339)
-		at, secs := refreshSchedule(now, exp, "", false)
-		if !at.Equal(now.Add(2*time.Minute)) || secs != 120 {
+	t.Run("expired waits two minutes and keeps the half-life interval", func(t *testing.T) {
+		later := exp.Add(time.Hour)
+		at, secs := refreshSchedule(later, exp.Format(time.RFC3339Nano), issued)
+		if secs != int(half/time.Second) || !at.Equal(later.Add(refreshRetryFloor)) {
 			t.Fatalf("at=%s secs=%d", at.Format(time.RFC3339Nano), secs)
 		}
 	})
-	t.Run("expired uses floor", func(t *testing.T) {
-		exp := now.Add(-time.Hour).Format(time.RFC3339)
-		at, secs := refreshSchedule(now, exp, "", false)
-		if !at.Equal(now.Add(2*time.Minute)) || secs != 120 {
-			t.Fatalf("at=%s secs=%d", at.Format(time.RFC3339Nano), secs)
-		}
-	})
-	t.Run("unparseable uses jitter", func(t *testing.T) {
-		at, secs := refreshSchedule(now, "not-a-timestamp", "", false)
-		if !at.Equal(now.Add(15*time.Minute)) || secs != 15*60 {
-			t.Fatalf("at=%s secs=%d", at.Format(time.RFC3339Nano), secs)
-		}
-	})
-	t.Run("reuse future stored", func(t *testing.T) {
-		stored := now.Add(12 * time.Minute).Format(time.RFC3339Nano)
-		exp := now.Add(24 * time.Hour).Format(time.RFC3339)
-		at, secs := refreshSchedule(now, exp, stored, true)
-		if !at.Equal(now.Add(12*time.Minute)) || secs != 12*60 {
-			t.Fatalf("at=%s secs=%d", at.Format(time.RFC3339Nano), secs)
-		}
-	})
-	t.Run("reuse does not outwait a soon expiry", func(t *testing.T) {
-		stored := now.Add(15 * time.Minute).Format(time.RFC3339)
-		exp := now.Add(8 * time.Minute)
-		at, _ := refreshSchedule(now, exp.Format(time.RFC3339), stored, true)
-		if !at.Equal(exp.Add(-2 * time.Minute)) {
-			t.Fatalf("at=%s", at.Format(time.RFC3339Nano))
-		}
-	})
-	t.Run("reuse past stored is discarded", func(t *testing.T) {
-		stored := now.Add(-time.Minute).Format(time.RFC3339)
-		exp := now.Add(24 * time.Hour).Format(time.RFC3339)
-		at, _ := refreshSchedule(now, exp, stored, true)
-		if !at.Equal(now.Add(15 * time.Minute)) {
-			t.Fatalf("at=%s", at.Format(time.RFC3339Nano))
-		}
-	})
-	t.Run("write ignores stored", func(t *testing.T) {
-		stored := now.Add(12 * time.Minute).Format(time.RFC3339)
-		exp := now.Add(24 * time.Hour).Format(time.RFC3339)
-		at, _ := refreshSchedule(now, exp, stored, false)
-		if !at.Equal(now.Add(15 * time.Minute)) {
-			t.Fatalf("at=%s", at.Format(time.RFC3339Nano))
-		}
-	})
-	t.Run("near stored is raised to the floor", func(t *testing.T) {
-		stored := now.Add(30 * time.Second).Format(time.RFC3339)
-		exp := now.Add(24 * time.Hour).Format(time.RFC3339)
-		at, secs := refreshSchedule(now, exp, stored, true)
-		if !at.Equal(now.Add(2*time.Minute)) || secs != 120 {
-			t.Fatalf("at=%s secs=%d", at.Format(time.RFC3339Nano), secs)
+	t.Run("unknown lifetime does not refresh", func(t *testing.T) {
+		for _, tc := range []struct {
+			expiration string
+			issued     time.Time
+		}{
+			{expiration: "not-a-timestamp", issued: issued},
+			{expiration: exp.Format(time.RFC3339Nano), issued: time.Time{}},
+			{expiration: issued.Format(time.RFC3339Nano), issued: exp},
+			{expiration: issued.Add(time.Second).Format(time.RFC3339Nano), issued: issued},
+		} {
+			at, secs := refreshSchedule(now, tc.expiration, tc.issued)
+			if !at.IsZero() || secs != 0 {
+				t.Fatalf("expiration=%q at=%s secs=%d", tc.expiration, at.Format(time.RFC3339Nano), secs)
+			}
 		}
 	})
 }
 
 func TestFinishLoginKeepsOperatorFields(t *testing.T) {
 	resetForTest(t)
-	old := refreshJitter
-	refreshJitter = func(at time.Time) time.Time { return at.Add(15 * time.Minute) }
-	t.Cleanup(func() { refreshJitter = old })
 
 	const kept = `{"type":"codearts","user_id":"u-keep","access_key_id":"AKOLD","secret_access_key":"old","security_token":"old","refresh_token":"rt-old","prefix":"codearts","disabled":true,"priority":7,"proxy_url":"http://proxy.example","note":"prod","next_refresh_after":"2000-01-01T00:00:00Z"}`
 	const other = `{"type":"codearts","prefix":"other","disabled":true,"priority":9}`
@@ -153,8 +112,12 @@ func TestFinishLoginKeepsOperatorFields(t *testing.T) {
 	}
 	stored := storedStringField(host.saved, "next_refresh_after")
 	at, ok := parseRFC3339(stored)
-	if !ok || at.Before(time.Now().Add(14*time.Minute)) || at.After(time.Now().Add(16*time.Minute)) {
+	if !ok || at.Before(time.Now().Add(11*time.Hour+50*time.Minute)) || at.After(time.Now().Add(12*time.Hour+10*time.Minute)) {
 		t.Fatalf("next_refresh_after = %q", stored)
+	}
+	secs, ok := intervalSeconds(auth.Metadata["refresh_interval_seconds"])
+	if !ok || secs < 11*60*60+50*60 || secs > 12*60*60 {
+		t.Fatalf("refresh_interval_seconds = %#v", auth.Metadata["refresh_interval_seconds"])
 	}
 }
 
